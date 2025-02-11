@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.py[cod]
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+*.parquet
+*.pkl
+venv/
+*.dylib.DS_Store
