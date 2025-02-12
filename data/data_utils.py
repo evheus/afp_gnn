@@ -89,7 +89,7 @@ def preprocess_data(df):
     df = df.between_time('09:00', '16:00')
 
     # removing half day
-    df = df[~((df.index.month == 11) & (df.index.day == 29))]
+    #df = df[~((df.index.month == 11) & (df.index.day == 29))]
 
     rolling_mean = df['log_return'].rolling(window=60, min_periods=1).mean()
     rolling_std = df['log_return'].rolling(window=60, min_periods=1).std()

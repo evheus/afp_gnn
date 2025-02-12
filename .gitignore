@@ -12,3 +12,4 @@ eggs/
 *.pkl
 venv/
 *.dylib.DS_Store
+**/.DS_Store
