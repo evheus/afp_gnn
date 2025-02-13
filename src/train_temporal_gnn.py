@@ -6,6 +6,18 @@ from pytorch_lightning.loggers import TensorBoardLogger
 
 from temporal_gnn import TemporalGNN, TemporalGNNLightning, get_temporal_model
 
+def dense_to_sparse(adj_matrix):
+    """
+    Convert dense adjacency matrix to edge indices.
+    
+    Args:
+        adj_matrix: Dense adjacency matrix of shape (num_nodes, num_nodes)
+        
+    Returns:
+        edge_index: COO format edge indices of shape (2, num_edges)
+    """
+    return torch.nonzero(adj_matrix).t()
+
 def parse_args():
     parser = argparse.ArgumentParser()
     
@@ -14,8 +26,6 @@ def parse_args():
                       help='Number of input features')
     parser.add_argument('--hidden_dim', type=int, default=64,
                       help='Hidden dimension size')
-    parser.add_argument('--num_classes', type=int, required=True,
-                      help='Number of output classes')
     parser.add_argument('--num_layers', type=int, default=2,
                       help='Number of GNN layers')
     parser.add_argument('--lstm_layers', type=int, default=1,
@@ -59,61 +69,59 @@ def parse_args():
     return parser.parse_args()
 
 class TemporalGraphDataset(torch.utils.data.Dataset):
-    def __init__(self, node_embeddings, adj_matrices, labels=None):
+    def __init__(self, node_features, adj_matrices, next_step_features):
         """
         Dataset for temporal graph data.
         
         Args:
-            node_embeddings: List of tensors, each of shape (sequence_length, num_nodes, num_features)
-            adj_matrices: List of tensors, each of shape (sequence_length, num_nodes, num_nodes)
-            labels: Tensor of shape (num_nodes,) containing node labels
+            node_features: Tensor of shape (num_samples, sequence_length, num_nodes, num_features)
+            adj_matrices: Tensor of shape (num_samples, sequence_length, num_nodes, num_nodes)
+            next_step_features: Tensor of shape (num_samples, num_nodes, num_features)
         """
-        self.node_embeddings = node_embeddings
-        self.adj_matrices = adj_matrices
-        self.labels = labels
+        self.node_features = node_features
+        # Convert dense adjacency matrices to sparse format
+        self.edge_indices = [[dense_to_sparse(adj) for adj in seq] for seq in adj_matrices]
+        self.next_step_features = next_step_features
         
     def __len__(self):
-        return len(self.node_embeddings)
+        return len(self.node_features)
         
     def __getitem__(self, idx):
-        item = {
-            'x_seq': self.node_embeddings[idx],
-            'adj_seq': self.adj_matrices[idx],
+        return {
+            'x_seq': self.node_features[idx],
+            'edge_index_seq': self.edge_indices[idx],  # Now returns sparse format
+            'y': self.next_step_features[idx]
         }
-        if self.labels is not None:
-            item['y'] = self.labels[idx]
-        return item
 
 def prepare_data(args):
     """
     Prepare the temporal graph data and masks.
     """
-    # Load node embeddings and adjacency matrices
-    # Assuming data is stored as a dictionary with 'embeddings', 'adjacency', and 'labels' keys
+    # Load node features and adjacency matrices
     data = torch.load(args.data_path)
     
-    node_embeddings = data['embeddings']  # (num_samples, sequence_length, num_nodes, num_features)
-    adj_matrices = data['adjacency']      # (num_samples, sequence_length, num_nodes, num_nodes)
-    labels = data['labels']               # (num_nodes,)
+    node_features = data['features']    # (num_samples, sequence_length, num_nodes, num_features)
+    adj_matrices = data['adjacency']    # (num_samples, sequence_length, num_nodes, num_nodes)
+    next_step_features = data['labels'] # (num_samples, num_nodes, num_features)
     
-    # Create masks for nodes
-    num_nodes = labels.size(0)
-    indices = torch.randperm(num_nodes)
+    # Create masks for samples
+    num_samples = len(node_features)
+    indices = torch.randperm(num_samples)
     
-    train_idx = indices[:int(0.7 * num_nodes)]
-    val_idx = indices[int(0.7 * num_nodes):int(0.8 * num_nodes)]
-    test_idx = indices[int(0.8 * num_nodes):]
+    train_idx = indices[:int(0.7 * num_samples)]
+    val_idx = indices[int(0.7 * num_samples):int(0.8 * num_samples)]
+    test_idx = indices[int(0.8 * num_samples):]
     
-    train_mask = torch.zeros(num_nodes, dtype=torch.bool)
-    val_mask = torch.zeros(num_nodes, dtype=torch.bool)
-    test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    train_mask = torch.zeros(num_samples, dtype=torch.bool)
+    val_mask = torch.zeros(num_samples, dtype=torch.bool)
+    test_mask = torch.zeros(num_samples, dtype=torch.bool)
     
     train_mask[train_idx] = True
     val_mask[val_idx] = True
     test_mask[test_idx] = True
     
     # Create dataset
-    dataset = TemporalGraphDataset(node_embeddings, adj_matrices, labels)
+    dataset = TemporalGraphDataset(node_features, adj_matrices, next_step_features)
     
     return dataset, train_mask, val_mask, test_mask
 
@@ -125,26 +133,25 @@ def main():
     pl.seed_everything(args.seed)
     
     # Prepare data
-    data, train_mask, val_mask, test_mask = prepare_data(args)
+    dataset, train_mask, val_mask, test_mask = prepare_data(args)
     
     # Create data loaders
-    # Note: Implement your DataLoader according to your data format
     train_loader = torch.utils.data.DataLoader(
-        data,
+        dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=4
     )
     
     val_loader = torch.utils.data.DataLoader(
-        data,
+        dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=4
     )
     
     test_loader = torch.utils.data.DataLoader(
-        data,
+        dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=4
@@ -165,17 +172,17 @@ def main():
     
     # Set up callbacks
     checkpoint_callback = ModelCheckpoint(
-        monitor='val_acc',
+        monitor='val_loss',  # Changed from val_acc to val_loss
         dirpath='checkpoints/',
-        filename='temporal-gnn-{epoch:02d}-{val_acc:.2f}',
+        filename='temporal-gnn-{epoch:02d}-{val_loss:.4f}',
         save_top_k=3,
-        mode='max'
+        mode='min'  # Changed from max to min since we're monitoring loss
     )
     
     early_stopping = EarlyStopping(
-        monitor='val_acc',
+        monitor='val_loss',  # Changed from val_acc to val_loss
         patience=args.patience,
-        mode='max'
+        mode='min'  # Changed from max to min
     )
     
     # Set up logger

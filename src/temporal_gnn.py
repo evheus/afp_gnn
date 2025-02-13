@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from torch.nn import LSTM, Linear, ModuleList
 import pytorch_lightning as pl
 
-# Import the directional convolution layers
 from .directed_gnn_layers import DirGCNConv, DirSAGEConv, DirGATConv
 
 class TemporalGNN(nn.Module):
@@ -12,7 +11,6 @@ class TemporalGNN(nn.Module):
         self,
         num_features,
         hidden_dim,
-        num_classes,
         num_gnn_layers=2,
         lstm_layers=1,
         conv_type="dir-gcn",
@@ -49,9 +47,9 @@ class TemporalGNN(nn.Module):
             bidirectional=bidirectional
         )
         
-        # Final prediction layer
+        # Final prediction layer - predicts next timestep's features
         lstm_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
-        self.predictor = Linear(lstm_output_dim, num_classes)
+        self.predictor = Linear(lstm_output_dim, num_features)  # Predict same number of features as input
         
     def _get_conv_layer(self, conv_type, in_dim, out_dim):
         if conv_type == "dir-gcn":
@@ -77,40 +75,43 @@ class TemporalGNN(nn.Module):
         Forward pass through the temporal GNN
         
         Args:
-            x_sequence: Tensor of shape (sequence_length, num_nodes, num_features)
+            x_sequence: Tensor of shape (num_samples, sequence_length, num_nodes, num_features)
             edge_index_sequence: List of edge_index tensors for each timestep
-        """
-        seq_length = x_sequence.size(0)
         
-        # Process each time step with GNN layers
+        Returns:
+            Predictions for next timestep's node features
+            Shape: (num_samples, num_nodes, num_features)
+        """
+        sequence_length = x_sequence.size(0)
+        
+        # Process each timestep with GNN layers
         gnn_outputs = []
-        for t in range(seq_length):
+        for t in range(sequence_length):
             x_t = x_sequence[t]
             edge_index_t = edge_index_sequence[t]
             
-            # Apply GNN layers directly with edge_index
+            # Apply GNN layers
             x_t = self._apply_gnn(x_t, edge_index_t)
             gnn_outputs.append(x_t)
             
         # Combine all timesteps
-        gnn_outputs = torch.stack(gnn_outputs, dim=1)  # (batch_size, seq_length, hidden_dim)
+        gnn_outputs = torch.stack(gnn_outputs, dim=1)  # (num_samples, sequence_length, hidden_dim)
+
+        # Apply LSTM to the sequence of node embeddings
+        lstm_out, _ = self.lstm(gnn_outputs)
+
+        # Use the final timestep's output for prediction
+        final_hidden = lstm_out[:, -1, :]
+
+        # Predict next timestep's node features
+        out = self.predictor(final_hidden)
         
-        # Apply LSTM to the sequence of graph embeddings
-        lstm_out, _ = self.lstm(gnn_outputs)  # (batch_size, seq_length, hidden_dim)
-        
-        # Use the final time step's output for prediction
-        final_hidden = lstm_out[:, -1, :]  # (batch_size, hidden_dim)
-        
-        # Make prediction
-        out = self.predictor(final_hidden)  # (batch_size, num_classes)
-        
-        return F.log_softmax(out, dim=1)
+        return out  # Direct regression output
 
 def get_temporal_model(args):
     return TemporalGNN(
         num_features=args.num_features,
         hidden_dim=args.hidden_dim,
-        num_classes=args.num_classes,
         num_gnn_layers=args.num_layers,
         lstm_layers=args.lstm_layers,
         conv_type=args.conv_type,
@@ -121,45 +122,46 @@ def get_temporal_model(args):
     )
 
 class TemporalGNNLightning(pl.LightningModule):
-    def __init__(self, model, lr, weight_decay, train_mask, val_mask, test_mask, evaluator=None):
+    def __init__(self, model, lr, weight_decay, train_mask, val_mask, test_mask):
         super().__init__()
         self.model = model
         self.lr = lr
         self.weight_decay = weight_decay
-        self.evaluator = evaluator
-        self.train_mask, self.val_mask, self.test_mask = train_mask, val_mask, test_mask
+        self.train_mask = train_mask
+        self.val_mask = val_mask
+        self.test_mask = test_mask
 
     def training_step(self, batch, batch_idx):
-        x_seq, edge_index_seq = batch.x_seq, batch.edge_index_seq
-        y = batch.y.long()
-        out = self.model(x_seq, edge_index_seq)
+        node_features_seq, edge_index_seq = batch.x_seq, batch.edge_index_seq
+        next_features = batch.y  # Next timestep's node features
+        out = self.model(node_features_seq, edge_index_seq)
 
-        loss = nn.functional.nll_loss(out[self.train_mask], y[self.train_mask].squeeze())
+        # MSE loss for regression
+        loss = F.mse_loss(out[self.train_mask], y[self.train_mask])
         self.log("train_loss", loss)
 
-        y_pred = out.max(1)[1]
-        train_acc = self.evaluate(y_pred=y_pred[self.train_mask], y_true=y[self.train_mask])
-        self.log("train_acc", train_acc)
-        val_acc = self.evaluate(y_pred=y_pred[self.val_mask], y_true=y[self.val_mask])
-        self.log("val_acc", val_acc)
+        # Calculate and log MAE for interpretability
+        mae = F.l1_loss(out[self.train_mask], y[self.train_mask])
+        self.log("train_mae", mae)
+
+        # Validation metrics
+        with torch.no_grad():
+            val_loss = F.mse_loss(out[self.val_mask], y[self.val_mask])
+            val_mae = F.l1_loss(out[self.val_mask], y[self.val_mask])
+            self.log("val_loss", val_loss)
+            self.log("val_mae", val_mae)
 
         return loss
 
-    def evaluate(self, y_pred, y_true):
-        if self.evaluator:
-            acc = self.evaluator.eval({"y_true": y_true, "y_pred": y_pred.unsqueeze(1)})["acc"]
-        else:
-            acc = y_pred.eq(y_true.squeeze()).sum().item() / y_pred.shape[0]
-        return acc
-
     def test_step(self, batch, batch_idx):
         x_seq, edge_index_seq = batch.x_seq, batch.edge_index_seq
-        y = batch.y.long()
+        y = batch.y
         out = self.model(x_seq, edge_index_seq)
 
-        y_pred = out.max(1)[1]
-        test_acc = self.evaluate(y_pred=y_pred[self.test_mask], y_true=y[self.test_mask])
-        self.log("test_acc", test_acc)
+        test_loss = F.mse_loss(out[self.test_mask], y[self.test_mask])
+        test_mae = F.l1_loss(out[self.test_mask], y[self.test_mask])
+        self.log("test_loss", test_loss)
+        self.log("test_mae", test_mae)
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
