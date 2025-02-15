@@ -1,4 +1,4 @@
-from data_utils import load_data, perform_eda
+from data.utils.data_utils import load_data, perform_eda
 import os
 
 

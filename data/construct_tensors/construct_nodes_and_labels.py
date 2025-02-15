@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 project_root = os.getcwd()
 sys.path.append(project_root)
 
-from data.data_utils import load_data_for_tickers
+from data.utils.data_utils import load_data_for_tickers
 
 def calculate_volatility(data: pd.DataFrame, window: str = '30min') -> pd.Series:
     """

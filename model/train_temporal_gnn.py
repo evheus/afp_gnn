@@ -22,7 +22,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     
     # Model parameters
-    parser.add_argument('--num_features', type=int, required=True,
+    parser.add_argument('--num_features', type=int, default=3, required=True,
                       help='Number of input features')
     parser.add_argument('--hidden_dim', type=int, default=64,
                       help='Hidden dimension size')
@@ -37,7 +37,7 @@ def parse_args():
                       help='Dropout rate')
     parser.add_argument('--alpha', type=float, default=0.5,
                       help='Alpha parameter for directional convolutions')
-    parser.add_argument('--learn_alpha', action='store_true',
+    parser.add_argument('--learn_alpha', action='store_true', default=False,
                       help='Whether to learn the alpha parameter')
     parser.add_argument('--bidirectional', action='store_true',
                       help='Whether to use bidirectional LSTM')

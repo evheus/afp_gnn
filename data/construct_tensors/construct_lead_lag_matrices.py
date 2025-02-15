@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 project_root = os.getcwd()
 sys.path.append(project_root)
 
-from data.data_utils import load_data_for_tickers
-from lead_lag import construct_lead_lag_matrix
+from data.utils.data_utils import load_data_for_tickers
+from data.utils.lead_lag import construct_lead_lag_matrix
 
 def load_and_process_data(
     tickers: set,

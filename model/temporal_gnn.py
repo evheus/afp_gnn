@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.nn import LSTM, Linear, ModuleList
 import pytorch_lightning as pl
 
-from .directed_gnn_layers import DirGCNConv, DirSAGEConv, DirGATConv
+from directed_gnn_layers import DirGCNConv, DirSAGEConv, DirGATConv
 
 class TemporalGNN(nn.Module):
     def __init__(

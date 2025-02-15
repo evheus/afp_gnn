@@ -10,17 +10,18 @@ import torch
 def row_norm(adj):
     """
     Applies the row-wise normalization:
-        \mathbf{D}_{out}^{-1} \mathbf{A}
+    D_out^(-1) A
+    where D_out is the out-degree diagonal matrix and A is the adjacency matrix.
     """
     row_sum = sparsesum(adj, dim=1)
-
     return mul(adj, 1 / row_sum.view(-1, 1))
 
 
 def directed_norm(adj):
     """
     Applies the normalization for directed graphs:
-        \mathbf{D}_{out}^{-1/2} \mathbf{A} \mathbf{D}_{in}^{-1/2}.
+    D_out^(-1/2) A D_in^(-1/2)
+    where D_out and D_in are the out-degree and in-degree diagonal matrices.
     """
     in_deg = sparsesum(adj, dim=0)
     in_deg_inv_sqrt = in_deg.pow_(-0.5)

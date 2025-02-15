@@ -10,7 +10,7 @@ from torch_geometric.nn import (
     JumpingKnowledge,
 )
 
-from src.utils.graph_norm_utils import get_norm_adj
+from utils.graph_norm_utils import get_norm_adj
 
 
 def get_conv(conv_type, input_dim, output_dim, alpha):
