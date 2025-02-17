@@ -13,3 +13,4 @@ eggs/
 venv/
 *.dylib.DS_Store
 **/.DS_Store
+*.pt

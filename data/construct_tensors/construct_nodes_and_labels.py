@@ -45,7 +45,10 @@ def create_feature_matrices(
                               end=processed_data.index.max(),
                               freq=freq)
     
-    for ticker in tickers:
+    # Use all tickers including SPY
+    all_tickers = list(dfs.keys())  # Changed from tickers to dfs.keys()
+    
+    for ticker in all_tickers:  # Changed from tickers to all_tickers
         # Calculate returns and volatility for each ticker
         price_data = processed_data[ticker]['close']
         processed_data[(ticker, 'returns')] = price_data.pct_change()
@@ -55,7 +58,7 @@ def create_feature_matrices(
     for current_time in calc_points:
         features = []
         
-        for ticker in tickers:
+        for ticker in all_tickers:  # Changed from tickers to all_tickers
             # Get returns, volume, and volatility
             returns = processed_data.loc[current_time, (ticker, 'returns')]
             volume = processed_data.loc[current_time, (ticker, 'volume')]
@@ -66,7 +69,7 @@ def create_feature_matrices(
         # Create feature matrix for current timestamp
         feature_matrices[current_time] = pd.DataFrame(
             features,
-            index=list(tickers),
+            index=all_tickers,  # Changed from list(tickers) to all_tickers
             columns=['returns', 'volume', 'volatility']
         )
     
@@ -234,3 +237,4 @@ if __name__ == "__main__":
     
     # Display information
     display_tensor_info(node_features, label_tensor, window_timestamps, node_list)
+    #print(node_features.shape, label_tensor.shape)

@@ -1,5 +1,11 @@
 import torch
 import os
+import sys
+
+# Add project root to Python path
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(project_root)
+
 from data.construct_tensors.construct_lead_lag_matrices import generate_leadlag_tensor
 from data.construct_tensors.construct_nodes_and_labels import generate_node_features
 
@@ -45,7 +51,14 @@ def prepare_training_data(
         'adjacency': torch.FloatTensor(adj_matrices),
         'labels': torch.FloatTensor(label_tensor),
         'timestamps': feat_timestamps,
-        'nodes': feat_nodes
+        'nodes': feat_nodes,
+        # Add metadata
+        'metadata': {
+            'num_features': node_features.shape[-1],
+            'sequence_length': sequence_length,
+            'num_nodes': len(feat_nodes),
+            'num_samples': node_features.shape[0]
+        }
     }
 
     # Create output directory if it doesn't exist

@@ -7,23 +7,48 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from temporal_gnn import TemporalGNN, TemporalGNNLightning, get_temporal_model
 
 def dense_to_sparse(adj_matrix):
-    """
-    Convert dense adjacency matrix to edge indices.
+    """Convert dense adjacency matrix to edge indices.
     
     Args:
         adj_matrix: Dense adjacency matrix of shape (num_nodes, num_nodes)
         
     Returns:
-        edge_index: COO format edge indices of shape (2, num_edges)
+        edge_index: Tuple of (row_indices, col_indices) each of shape (num_edges,)
     """
-    return torch.nonzero(adj_matrix).t()
+    indices = torch.nonzero(adj_matrix).t()
+    if indices.size(1) > 0:
+        row, col = indices[0], indices[1]
+        return row, col
+    return torch.zeros(2, 0, dtype=torch.long)
 
 def parse_args():
     parser = argparse.ArgumentParser()
     
+    # Data parameters with default that will be overridden in main()
+    parser.add_argument('--data_path', type=str,
+                      default='data/processed/training_data.pt',
+                      help='Path to the dataset')
+    
+    # Load metadata from saved tensors using the default path
+    try:
+        # First try with weights_only=False
+        data = torch.load(parser.get_default('data_path'), weights_only=False)
+    except Exception as e:
+        print("Warning: Loading with weights_only=False failed. Adding safe globals and retrying...")
+        # Add pandas timestamp unpickler to safe globals
+        from pandas._libs.tslibs.timestamps import _unpickle_timestamp
+        torch.serialization.add_safe_globals([_unpickle_timestamp])
+        data = torch.load(parser.get_default('data_path'), weights_only=False)
+    
+    metadata = data['metadata']
+    
     # Model parameters
-    parser.add_argument('--num_features', type=int, default=3, required=True,
+    parser.add_argument('--num_features', type=int, 
+                      default=metadata['num_features'],
                       help='Number of input features')
+    parser.add_argument('--sequence_length', type=int,
+                      default=metadata['sequence_length'],
+                      help='Length of temporal sequences')
     parser.add_argument('--hidden_dim', type=int, default=64,
                       help='Hidden dimension size')
     parser.add_argument('--num_layers', type=int, default=2,
@@ -54,51 +79,71 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=32,
                       help='Batch size')
     
-    # Data parameters
-    parser.add_argument('--data_path', type=str, required=True,
-                      help='Path to the dataset')
-    parser.add_argument('--sequence_length', type=int, required=True,
-                      help='Length of temporal sequences')
-    
     # Other parameters
     parser.add_argument('--seed', type=int, default=42,
                       help='Random seed')
     parser.add_argument('--gpu', type=int, default=0,
                       help='GPU index to use')
     
-    return parser.parse_args()
+    args = parser.parse_args()
+    return args
 
 class TemporalGraphDataset(torch.utils.data.Dataset):
     def __init__(self, node_features, adj_matrices, next_step_features):
-        """
-        Dataset for temporal graph data.
-        
-        Args:
-            node_features: Tensor of shape (num_samples, sequence_length, num_nodes, num_features)
-            adj_matrices: Tensor of shape (num_samples, sequence_length, num_nodes, num_nodes)
-            next_step_features: Tensor of shape (num_samples, num_nodes, num_features)
-        """
         self.node_features = node_features
-        # Convert dense adjacency matrices to sparse format
-        self.edge_indices = [[dense_to_sparse(adj) for adj in seq] for seq in adj_matrices]
+        # Convert dense adjacency matrices to sparse format and stack correctly
+        self.edge_indices = []
+        for sample in adj_matrices:
+            sample_edges = []
+            for adj in sample:
+                row, col = dense_to_sparse(adj)
+                # Create edge_index tensor of shape (2, num_edges)
+                edge_index = torch.stack([row, col])  # correctly shapes to (2, num_edges)
+                sample_edges.append(edge_index)
+            self.edge_indices.append(sample_edges)
         self.next_step_features = next_step_features
-        
+
     def __len__(self):
         return len(self.node_features)
-        
+
     def __getitem__(self, idx):
         return {
             'x_seq': self.node_features[idx],
-            'edge_index_seq': self.edge_indices[idx],  # Now returns sparse format
+            # Return the already correctly formatted list of edge_index tensors
+            'edge_index_seq': self.edge_indices[idx],
             'y': self.next_step_features[idx]
         }
+
+def custom_collate(batch):
+    collated = {}
+    # Stack node feature sequences and targets normally.
+    collated["x_seq"] = torch.stack([item["x_seq"] for item in batch], dim=0)
+    collated["y"] = torch.stack([item["y"] for item in batch], dim=0)
+    
+    # Each sample's edge_index_seq is a list of tensors (one per time step)
+    sequence_length = len(batch[0]["edge_index_seq"])
+    collated_edge_index_seq = []
+    
+    # For each time step, concatenate edge_index tensors along dim=1, then move them to CPU.
+    for t in range(sequence_length):
+        edge_indices_t = [sample["edge_index_seq"][t] for sample in batch]
+        aggregated_edge_index = torch.cat(edge_indices_t, dim=1).cpu()  # <-- fix here
+        collated_edge_index_seq.append(aggregated_edge_index)
+    
+    collated["edge_index_seq"] = collated_edge_index_seq
+    return collated
 
 def prepare_data(args):
     """
     Prepare the temporal graph data and masks.
     """
-    # Load node features and adjacency matrices
-    data = torch.load(args.data_path)
+    # Load node features and adjacency matrices with appropriate settings
+    try:
+        data = torch.load(args.data_path, weights_only=False)
+    except Exception as e:
+        from pandas._libs.tslibs.timestamps import _unpickle_timestamp
+        torch.serialization.add_safe_globals([_unpickle_timestamp])
+        data = torch.load(args.data_path, weights_only=False)
     
     node_features = data['features']    # (num_samples, sequence_length, num_nodes, num_features)
     adj_matrices = data['adjacency']    # (num_samples, sequence_length, num_nodes, num_nodes)
@@ -126,11 +171,20 @@ def prepare_data(args):
     return dataset, train_mask, val_mask, test_mask
 
 def main():
+    # Set default data path
+    default_data_path = 'data/processed/training_data.pt'
+    
     # Parse arguments
     args = parse_args()
     
+    # Override data_path with default
+    args.data_path = default_data_path
+    
     # Set random seed
     pl.seed_everything(args.seed)
+    
+    # Print data path being used
+    print(f"Using data from: {args.data_path}")
     
     # Prepare data
     dataset, train_mask, val_mask, test_mask = prepare_data(args)
@@ -140,21 +194,24 @@ def main():
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4
+        num_workers=4,
+        collate_fn=custom_collate
     )
     
     val_loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4
+        num_workers=4,
+        collate_fn=custom_collate
     )
     
     test_loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4
+        num_workers=4,
+        collate_fn=custom_collate
     )
     
     # Create model

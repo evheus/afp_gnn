@@ -210,4 +210,4 @@ if __name__ == "__main__":
     # Display information
     display_tensor_info(tensor, window_timestamps, node_list)
 
-    print(tensor)
+    print(tensor.shape)

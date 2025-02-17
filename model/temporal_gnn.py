@@ -62,51 +62,58 @@ class TemporalGNN(nn.Module):
             raise ValueError(f"Unsupported convolution type: {conv_type}")
             
     def _apply_gnn(self, x, edge_index):
-        """Apply all GNN layers to a single time step"""
-        for i, conv in enumerate(self.gnn_layers):
-            x = conv(x, edge_index)
-            if i != len(self.gnn_layers) - 1:  # Don't apply activation to final layer
-                x = F.relu(x)
-                x = F.dropout(x, p=self.dropout, training=self.training)
-        return x
+        # Save the original device (e.g., mps)
+        orig_device = x.device
+
+        # Move x to CPU for the sparse operations.
+        x_cpu = x.cpu()
+        # Temporarily move all GNN layers to CPU.
+        self.gnn_layers.to("cpu")
+
+        for conv in self.gnn_layers:
+            x_cpu = conv(x_cpu, edge_index)
+            x_cpu = F.relu(x_cpu)
+            x_cpu = F.dropout(x_cpu, p=self.dropout, training=self.training)
+
+        # Move the output back to the original device.
+        out = x_cpu.to(orig_device)
+
+        # (Optional) Move the GNN layers back to orig_device for subsequent operations.
+        self.gnn_layers.to(orig_device)
+
+        return out
     
     def forward(self, x_sequence, edge_index_sequence):
-        """
-        Forward pass through the temporal GNN
+        """Forward pass through the temporal GNN
         
         Args:
-            x_sequence: Tensor of shape (num_samples, sequence_length, num_nodes, num_features)
-            edge_index_sequence: List of edge_index tensors for each timestep
-        
-        Returns:
-            Predictions for next timestep's node features
-            Shape: (num_samples, num_nodes, num_features)
+            x_sequence: Tensor of shape (batch, sequence_length, num_nodes, num_features)
+            edge_index_sequence: List of edge_index tensors of shape (2, num_edges)
         """
-        sequence_length = x_sequence.size(0)
-        
-        # Process each timestep with GNN layers
+        batch_size, sequence_length = x_sequence.size(0), x_sequence.size(1)
         gnn_outputs = []
+        
+        # Temporary debugging in TemporalGNN.forward
         for t in range(sequence_length):
-            x_t = x_sequence[t]
+            x_t = x_sequence[:, t]  # (batch, num_nodes, num_features)
             edge_index_t = edge_index_sequence[t]
-            
-            # Apply GNN layers
+            # Debug: Check edge_index_t structure
+            print(f"Time step {t}: type {type(edge_index_t)}, shape {edge_index_t.shape if torch.is_tensor(edge_index_t) else 'Not a tensor'}")
+            assert torch.is_tensor(edge_index_t), "edge_index_t is not a tensor!"
+            assert edge_index_t.size(0) == 2, f"Expected shape[0]==2, got {edge_index_t.size(0)} at t={t}"
             x_t = self._apply_gnn(x_t, edge_index_t)
             gnn_outputs.append(x_t)
-            
-        # Combine all timesteps
-        gnn_outputs = torch.stack(gnn_outputs, dim=1)  # (num_samples, sequence_length, hidden_dim)
-
-        # Apply LSTM to the sequence of node embeddings
-        lstm_out, _ = self.lstm(gnn_outputs)
-
-        # Use the final timestep's output for prediction
-        final_hidden = lstm_out[:, -1, :]
-
-        # Predict next timestep's node features
-        out = self.predictor(final_hidden)
         
-        return out  # Direct regression output
+        # Stack along sequence dimension
+        gnn_outputs = torch.stack(gnn_outputs, dim=1)
+        
+        # Apply LSTM
+        lstm_out, _ = self.lstm(gnn_outputs)
+        final_hidden = lstm_out[:, -1, :]
+        
+        # Predict
+        out = self.predictor(final_hidden)
+        return out
 
 def get_temporal_model(args):
     return TemporalGNN(
@@ -132,30 +139,39 @@ class TemporalGNNLightning(pl.LightningModule):
         self.test_mask = test_mask
 
     def training_step(self, batch, batch_idx):
-        node_features_seq, edge_index_seq = batch.x_seq, batch.edge_index_seq
-        next_features = batch.y  # Next timestep's node features
-        out = self.model(node_features_seq, edge_index_seq)
-
-        # MSE loss for regression
+        # Access as dictionary instead of attributes
+        x_seq = batch['x_seq']
+        edge_index_seq = batch['edge_index_seq']
+        y = batch['y']
+        
+        # Forward pass
+        out = self.model(x_seq, edge_index_seq)
+        
+        # Calculate loss using the training mask
         loss = F.mse_loss(out[self.train_mask], y[self.train_mask])
-        self.log("train_loss", loss)
-
-        # Calculate and log MAE for interpretability
-        mae = F.l1_loss(out[self.train_mask], y[self.train_mask])
-        self.log("train_mae", mae)
-
-        # Validation metrics
-        with torch.no_grad():
-            val_loss = F.mse_loss(out[self.val_mask], y[self.val_mask])
-            val_mae = F.l1_loss(out[self.val_mask], y[self.val_mask])
-            self.log("val_loss", val_loss)
-            self.log("val_mae", val_mae)
-
+        self.log('train_loss', loss)
         return loss
 
+    def validation_step(self, batch, batch_idx):
+        # Access dictionary items
+        x_seq = batch['x_seq']
+        edge_index_seq = batch['edge_index_seq']
+        y = batch['y']
+        
+        # Forward pass
+        out = self.model(x_seq, edge_index_seq)
+        
+        # Calculate validation loss using the validation mask
+        val_loss = F.mse_loss(out[self.val_mask], y[self.val_mask])
+        self.log('val_loss', val_loss)
+        return val_loss
+
     def test_step(self, batch, batch_idx):
-        x_seq, edge_index_seq = batch.x_seq, batch.edge_index_seq
-        y = batch.y
+        # Access as dictionary instead of attributes
+        x_seq = batch['x_seq']
+        edge_index_seq = batch['edge_index_seq']
+        y = batch['y']
+        
         out = self.model(x_seq, edge_index_seq)
 
         test_loss = F.mse_loss(out[self.test_mask], y[self.test_mask])
@@ -166,3 +182,11 @@ class TemporalGNNLightning(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         return optimizer
+
+    def transfer_batch_to_device(self, batch, device, dataloader_idx):
+        # Only move the tensors that should be on the GPU.
+        batch["x_seq"] = batch["x_seq"].to(device)
+        batch["y"] = batch["y"].to(device)
+        # Do NOT move edge_index_seq; leave it on CPU.
+        # Note: edge_index_seq is a list of tensors.
+        return batch
