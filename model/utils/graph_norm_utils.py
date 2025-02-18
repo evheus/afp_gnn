@@ -23,11 +23,16 @@ def directed_norm(adj):
     D_out^(-1/2) A D_in^(-1/2)
     where D_out and D_in are the out-degree and in-degree diagonal matrices.
     """
+    # Assuming `adj` is a SparseTensor from torch_sparse
+    # Ensure that the storage's row indices are on CPU.
+    row, _, _ = adj.coo()  # unpack row, col, and value
+    row = row.cpu()
+    # Proceed with your normalization (e.g., summation)
+    out_deg = sparsesum(adj, dim=1)
     in_deg = sparsesum(adj, dim=0)
     in_deg_inv_sqrt = in_deg.pow_(-0.5)
     in_deg_inv_sqrt.masked_fill_(in_deg_inv_sqrt == float("inf"), 0.0)
 
-    out_deg = sparsesum(adj, dim=1)
     out_deg_inv_sqrt = out_deg.pow_(-0.5)
     out_deg_inv_sqrt.masked_fill_(out_deg_inv_sqrt == float("inf"), 0.0)
 
@@ -59,7 +64,8 @@ def get_mask(idx, num_nodes):
 
 def get_adj(edge_index, num_nodes, graph_type="directed"):
     """
-    Return the type of adjacency matrix specified by `graph_type` as sparse tensor.
+    Return the type of adjacency matrix specified by `graph_type` as a SparseTensor.
+    Ensures that the tensor indices are on CPU.
     """
     if graph_type == "transpose":
         edge_index = torch.stack([edge_index[1], edge_index[0]])
@@ -70,7 +76,9 @@ def get_adj(edge_index, num_nodes, graph_type="directed"):
     else:
         raise ValueError(f"{graph_type} is not a valid graph type")
 
-    value = torch.ones((edge_index.size(1),), device=edge_index.device)
+    # Ensure the edge_index (and value) live on CPU.
+    edge_index = edge_index.cpu()
+    value = torch.ones((edge_index.size(1),), device="cpu")
     return SparseTensor(row=edge_index[0], col=edge_index[1], value=value, sparse_sizes=(num_nodes, num_nodes))
 
 

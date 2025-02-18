@@ -25,9 +25,9 @@ def create_feature_matrices(
     matrix_lookback: str = '30min',
     freq: str = '1min',
     data_folder: str = 'data/ohlcv'
-) -> Dict[pd.Timestamp, pd.DataFrame]:
+) -> Tuple[Dict[pd.Timestamp, pd.DataFrame], List[str]]:
     """
-    Create feature matrices for each timestamp.
+    Create feature matrices for each timestamp and return the column names.
     """
     # Load data
     dfs = load_data_for_tickers(tickers, [start_date, end_date], data_folder)
@@ -55,6 +55,8 @@ def create_feature_matrices(
         processed_data[(ticker, 'volatility')] = calculate_volatility(price_data, matrix_lookback)
     
     # Select features for each timestamp
+    # We define feature_names here explicitly (or you can derive them if they change dynamically)
+    feature_names = ['returns', 'volume', 'volatility']
     for current_time in calc_points:
         features = []
         
@@ -70,10 +72,10 @@ def create_feature_matrices(
         feature_matrices[current_time] = pd.DataFrame(
             features,
             index=all_tickers,  # Changed from list(tickers) to all_tickers
-            columns=['returns', 'volume', 'volatility']
+            columns=feature_names
         )
     
-    return feature_matrices
+    return feature_matrices, feature_names
 
 def create_feature_and_label_tensors(
     matrices: Dict[pd.Timestamp, pd.DataFrame],
@@ -149,7 +151,7 @@ def generate_node_features(
         - node_list: List of node identifiers in order
     """
     # Generate feature matrices
-    matrices = create_feature_matrices(
+    matrices, feature_names = create_feature_matrices(
         tickers,
         start_date,
         end_date,
@@ -169,6 +171,44 @@ def generate_node_features(
     node_list = list(matrices[window_timestamps[0]].index)
     
     return node_features, label_tensor, window_timestamps, node_list
+
+def generate_node_features_with_features(
+    tickers: set,
+    start_date: str,
+    end_date: str,
+    matrix_lookback: str = '30min',
+    sequence_length: int = 5,
+    freq: str = '1min',
+    data_folder: str = 'data/ohlcv'
+) -> Tuple[np.ndarray, np.ndarray, List[pd.Timestamp], List[str], List[str]]:
+    """
+    Generate feature and label tensors from raw data along with feature names.
+    
+    Returns:
+        node_features: (num_samples, sequence_length, num_nodes, num_features)
+        label_tensor: (num_samples, num_nodes, num_features)
+        window_timestamps: list of timestamps for each window
+        node_list: list of node identifiers in order
+        feature_names: list of feature names (e.g., ['returns', 'volume', 'volatility'])
+    """
+    matrices, feature_names = create_feature_matrices(
+        tickers,
+        start_date,
+        end_date,
+        matrix_lookback,
+        freq,
+        data_folder
+    )
+    
+    node_features, label_tensor, window_timestamps = create_feature_and_label_tensors(
+        matrices,
+        sequence_length,
+        freq
+    )
+    
+    node_list = list(matrices[window_timestamps[0]].index)
+    
+    return node_features, label_tensor, window_timestamps, node_list, feature_names
 
 def display_tensor_info(
     node_features: np.ndarray,

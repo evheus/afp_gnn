@@ -84,36 +84,48 @@ class TemporalGNN(nn.Module):
         return out
     
     def forward(self, x_sequence, edge_index_sequence):
-        """Forward pass through the temporal GNN
+        """
+        Forward pass through the temporal GNN.
         
         Args:
             x_sequence: Tensor of shape (batch, sequence_length, num_nodes, num_features)
-            edge_index_sequence: List of edge_index tensors of shape (2, num_edges)
+            edge_index_sequence: List of edge_index tensors for each time step,
+                                 where each tensor is of shape (2, num_edges)
+        Returns:
+            predictions: Tensor of shape (batch, num_nodes, output_dim)
+                         with per-node predictions (e.g. future prices).
         """
-        batch_size, sequence_length = x_sequence.size(0), x_sequence.size(1)
+        batch_size, sequence_length, num_nodes, _ = x_sequence.size()
         gnn_outputs = []
         
-        # Temporary debugging in TemporalGNN.forward
+        # Process each time step individually.
         for t in range(sequence_length):
-            x_t = x_sequence[:, t]  # (batch, num_nodes, num_features)
+            x_t = x_sequence[:, t]  # Shape: (batch, num_nodes, num_features)
             edge_index_t = edge_index_sequence[t]
-            # Debug: Check edge_index_t structure
-            print(f"Time step {t}: type {type(edge_index_t)}, shape {edge_index_t.shape if torch.is_tensor(edge_index_t) else 'Not a tensor'}")
-            assert torch.is_tensor(edge_index_t), "edge_index_t is not a tensor!"
-            assert edge_index_t.size(0) == 2, f"Expected shape[0]==2, got {edge_index_t.size(0)} at t={t}"
+            # Apply the GNN layers on the snapshot for time step t.
+            # _apply_gnn should output a tensor of shape (batch, num_nodes, hidden_dim)
             x_t = self._apply_gnn(x_t, edge_index_t)
             gnn_outputs.append(x_t)
         
-        # Stack along sequence dimension
+        # Stack over time to build the temporal dimension.
+        # gnn_outputs now has shape: (batch, sequence_length, num_nodes, hidden_dim)
         gnn_outputs = torch.stack(gnn_outputs, dim=1)
         
-        # Apply LSTM
-        lstm_out, _ = self.lstm(gnn_outputs)
-        final_hidden = lstm_out[:, -1, :]
+        # Reshape the tensor so that each node's sequence is processed individually by the LSTM.
+        B, T, N, H = gnn_outputs.size()
+        node_sequences = gnn_outputs.view(B * N, T, H)
         
-        # Predict
-        out = self.predictor(final_hidden)
-        return out
+        # Process each node's temporal sequence using the LSTM.
+        lstm_out, _ = self.lstm(node_sequences)
+        # For prediction, we use the final hidden state from the LSTM for each node.
+        final_hidden = lstm_out[:, -1, :]  # Shape: (B * N, H')
+        
+        # Pass through a predictor layer (e.g., a Linear layer) to output the predicted price.
+        predictions = self.predictor(final_hidden)  # Expected shape: (B * N, output_dim)
+        
+        # Reshape predictions back to (batch, num_nodes, output_dim)
+        predictions = predictions.view(B, N, -1)
+        return predictions
 
 def get_temporal_model(args):
     return TemporalGNN(
@@ -129,64 +141,121 @@ def get_temporal_model(args):
     )
 
 class TemporalGNNLightning(pl.LightningModule):
-    def __init__(self, model, lr, weight_decay, train_mask, val_mask, test_mask):
+    def __init__(
+        self,
+        model,
+        lr,
+        weight_decay,
+        target_tickers=None,
+        target_features="returns",   # Default now predicts only 'returns'
+        metadata=None,
+    ):
+        """
+        Args:
+            model: An instance of TemporalGNN.
+            lr: Learning rate.
+            weight_decay: Weight decay.
+            target_tickers: Optional list of tickers to restrict predictions.
+            target_features: Feature name or list of feature names to select for prediction.
+                            Default is "returns".
+            metadata: Dictionary that includes ticker_to_index and feature_to_index.
+        """
         super().__init__()
         self.model = model
         self.lr = lr
         self.weight_decay = weight_decay
-        self.train_mask = train_mask
-        self.val_mask = val_mask
-        self.test_mask = test_mask
+        self.metadata = metadata or {}
+        
+        # Set up ticker restriction if provided.
+        if target_tickers is not None:
+            if 'ticker_to_index' not in self.metadata:
+                raise ValueError("metadata must include ticker_to_index if using target_tickers.")
+            ticker_to_index = self.metadata['ticker_to_index']
+            self.target_nodes = [ticker_to_index[ticker] for ticker in target_tickers if ticker in ticker_to_index]
+            if len(self.target_nodes) == 0:
+                raise ValueError("None of the provided target tickers were found.")
+        else:
+            self.target_nodes = None
+
+        # Set up feature selection.
+        if target_features is not None:
+            if 'feature_to_index' not in self.metadata:
+                raise ValueError("metadata must include feature_to_index if using target_features.")
+            # Allow target_features as string or list.
+            if isinstance(target_features, str):
+                self.target_feature_indices = [self.metadata['feature_to_index'][target_features]]
+            else:
+                self.target_feature_indices = [self.metadata['feature_to_index'][feat] for feat in target_features]
+        else:
+            # Default to predicting all features (should not happen with our new default)
+            self.target_feature_indices = None
+
+    def on_before_batch_transfer(self, batch, device):
+        # Ensure x_seq and y are moved to the training device,
+        # but leave edge_index_seq on CPU (for sparse operations).
+        batch["x_seq"] = batch["x_seq"].to(device)
+        batch["y"] = batch["y"].to(device)
+        return batch
 
     def training_step(self, batch, batch_idx):
-        # Access as dictionary instead of attributes
-        x_seq = batch['x_seq']
-        edge_index_seq = batch['edge_index_seq']
-        y = batch['y']
-        
-        # Forward pass
-        out = self.model(x_seq, edge_index_seq)
-        
-        # Calculate loss using the training mask
-        loss = F.mse_loss(out[self.train_mask], y[self.train_mask])
-        self.log('train_loss', loss)
+        x_seq = batch['x_seq']                    # (batch, sequence_length, num_nodes, num_features)
+        edge_index_seq = batch['edge_index_seq']    # remains on CPU (or as originally collated)
+        y = batch['y']                            # (batch, label_node_count, output_dim)
+
+        pred = self.model(x_seq, edge_index_seq)    # (batch, full_num_nodes, output_dim)
+        pred, y = self._adjust_predictions_and_labels(pred, y)
+        loss = F.mse_loss(pred, y)
+        self.log('train_loss', loss, batch_size=x_seq.size(0))
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # Access dictionary items
         x_seq = batch['x_seq']
         edge_index_seq = batch['edge_index_seq']
         y = batch['y']
-        
-        # Forward pass
-        out = self.model(x_seq, edge_index_seq)
-        
-        # Calculate validation loss using the validation mask
-        val_loss = F.mse_loss(out[self.val_mask], y[self.val_mask])
-        self.log('val_loss', val_loss)
+
+        pred = self.model(x_seq, edge_index_seq)
+        pred, y = self._adjust_predictions_and_labels(pred, y)
+        val_loss = F.mse_loss(pred, y)
+        self.log('val_loss', val_loss, batch_size=x_seq.size(0))
         return val_loss
 
     def test_step(self, batch, batch_idx):
-        # Access as dictionary instead of attributes
         x_seq = batch['x_seq']
         edge_index_seq = batch['edge_index_seq']
         y = batch['y']
-        
-        out = self.model(x_seq, edge_index_seq)
 
-        test_loss = F.mse_loss(out[self.test_mask], y[self.test_mask])
-        test_mae = F.l1_loss(out[self.test_mask], y[self.test_mask])
-        self.log("test_loss", test_loss)
-        self.log("test_mae", test_mae)
+        pred = self.model(x_seq, edge_index_seq)
+        pred, y = self._adjust_predictions_and_labels(pred, y)
+        test_loss = F.mse_loss(pred, y)
+        test_mae = F.l1_loss(pred, y)
+        self.log("test_loss", test_loss, batch_size=x_seq.size(0))
+        self.log("test_mae", test_mae, batch_size=x_seq.size(0))
+
+    def _adjust_predictions_and_labels(self, pred, y):
+        """
+        Adjust predictions and labels by optionally selecting a subset of nodes and features.
+        """
+        # First, ensure y is on the same device as pred.
+        y = y.to(pred.device)
+
+        # Restrict to target nodes if specified.
+        if self.target_nodes is not None:
+            target_nodes = torch.tensor(self.target_nodes, device=pred.device)
+            pred = pred.index_select(1, target_nodes)
+            y = y.index_select(1, target_nodes)
+        elif pred.size(1) != y.size(1):
+            self.print(f"Adjusting prediction tensor from shape {pred.shape} to match labels shape {y.shape}")
+            pred = pred[:, :y.size(1), :]
+
+        # Now, restrict to target feature(s) if specified.
+        if self.target_feature_indices is not None:
+            feature_idx_tensor = torch.tensor(self.target_feature_indices, device=pred.device)
+            # Assume the feature dimension is the last one.
+            pred = pred.index_select(2, feature_idx_tensor)
+            y = y.index_select(2, feature_idx_tensor)
+            
+        return pred, y
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         return optimizer
-
-    def transfer_batch_to_device(self, batch, device, dataloader_idx):
-        # Only move the tensors that should be on the GPU.
-        batch["x_seq"] = batch["x_seq"].to(device)
-        batch["y"] = batch["y"].to(device)
-        # Do NOT move edge_index_seq; leave it on CPU.
-        # Note: edge_index_seq is a list of tensors.
-        return batch

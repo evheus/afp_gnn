@@ -7,7 +7,7 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.append(project_root)
 
 from data.construct_tensors.construct_lead_lag_matrices import generate_leadlag_tensor
-from data.construct_tensors.construct_nodes_and_labels import generate_node_features
+from data.construct_tensors.construct_nodes_and_labels import generate_node_features_with_features
 
 def prepare_training_data(
     tickers,
@@ -30,8 +30,8 @@ def prepare_training_data(
         data_folder
     )
 
-    # Generate node features and labels
-    node_features, label_tensor, feat_timestamps, feat_nodes = generate_node_features(
+    # Generate node features and labels, and also capture feature names
+    node_features, label_tensor, feat_timestamps, feat_nodes, feature_names = generate_node_features_with_features(
         tickers,
         start_date,
         end_date,
@@ -45,19 +45,25 @@ def prepare_training_data(
     assert len(adj_timestamps) == len(feat_timestamps), "Timestamp mismatch"
     assert adj_nodes == feat_nodes, "Node list mismatch"
 
-    # Convert to PyTorch tensors
+    # Create ticker to index mapping using feat_nodes (the ordered node list)
+    ticker_to_index = {ticker: idx for idx, ticker in enumerate(feat_nodes)}
+    # Create feature_to_index mapping using the feature names from construct_nodes_and_labels.py
+    feature_to_index = {feature: idx for idx, feature in enumerate(feature_names)}
+
+    # Convert to PyTorch tensors and include mapping in metadata
     data_dict = {
         'features': torch.FloatTensor(node_features),
         'adjacency': torch.FloatTensor(adj_matrices),
         'labels': torch.FloatTensor(label_tensor),
         'timestamps': feat_timestamps,
         'nodes': feat_nodes,
-        # Add metadata
         'metadata': {
             'num_features': node_features.shape[-1],
             'sequence_length': sequence_length,
             'num_nodes': len(feat_nodes),
-            'num_samples': node_features.shape[0]
+            'num_samples': node_features.shape[0],
+            'ticker_to_index': ticker_to_index,
+            'feature_to_index': feature_to_index  # New mapping added here.
         }
     }
 

@@ -49,7 +49,7 @@ def parse_args():
     parser.add_argument('--sequence_length', type=int,
                       default=metadata['sequence_length'],
                       help='Length of temporal sequences')
-    parser.add_argument('--hidden_dim', type=int, default=64,
+    parser.add_argument('--hidden_dim', type=int, default=32,
                       help='Hidden dimension size')
     parser.add_argument('--num_layers', type=int, default=2,
                       help='Number of GNN layers')
@@ -116,18 +116,14 @@ class TemporalGraphDataset(torch.utils.data.Dataset):
 
 def custom_collate(batch):
     collated = {}
-    # Stack node feature sequences and targets normally.
     collated["x_seq"] = torch.stack([item["x_seq"] for item in batch], dim=0)
     collated["y"] = torch.stack([item["y"] for item in batch], dim=0)
     
-    # Each sample's edge_index_seq is a list of tensors (one per time step)
     sequence_length = len(batch[0]["edge_index_seq"])
     collated_edge_index_seq = []
-    
-    # For each time step, concatenate edge_index tensors along dim=1, then move them to CPU.
     for t in range(sequence_length):
         edge_indices_t = [sample["edge_index_seq"][t] for sample in batch]
-        aggregated_edge_index = torch.cat(edge_indices_t, dim=1).cpu()  # <-- fix here
+        aggregated_edge_index = torch.cat(edge_indices_t, dim=1).cpu()  # Force indices to CPU.
         collated_edge_index_seq.append(aggregated_edge_index)
     
     collated["edge_index_seq"] = collated_edge_index_seq
@@ -146,31 +142,30 @@ def prepare_data(args):
         data = torch.load(args.data_path, weights_only=False)
     
     node_features = data['features']    # (num_samples, sequence_length, num_nodes, num_features)
-    adj_matrices = data['adjacency']    # (num_samples, sequence_length, num_nodes, num_nodes)
-    next_step_features = data['labels'] # (num_samples, num_nodes, num_features)
-    
-    # Create masks for samples
+    adj_matrices = data['adjacency']      # (num_samples, sequence_length, num_nodes, num_nodes)
+    next_step_features = data['labels']   # (num_samples, num_nodes, num_features)
+
+    # Create indices for splits
     num_samples = len(node_features)
     indices = torch.randperm(num_samples)
-    
-    train_idx = indices[:int(0.7 * num_samples)]
-    val_idx = indices[int(0.7 * num_samples):int(0.8 * num_samples)]
-    test_idx = indices[int(0.8 * num_samples):]
-    
-    train_mask = torch.zeros(num_samples, dtype=torch.bool)
-    val_mask = torch.zeros(num_samples, dtype=torch.bool)
-    test_mask = torch.zeros(num_samples, dtype=torch.bool)
-    
-    train_mask[train_idx] = True
-    val_mask[val_idx] = True
-    test_mask[test_idx] = True
-    
-    # Create dataset
+
+    train_idx = indices[:int(0.7 * num_samples)].tolist()
+    val_idx = indices[int(0.7 * num_samples):int(0.8 * num_samples)].tolist()
+    test_idx = indices[int(0.8 * num_samples):].tolist()
+
+    # Create full dataset
     dataset = TemporalGraphDataset(node_features, adj_matrices, next_step_features)
-    
-    return dataset, train_mask, val_mask, test_mask
+
+    # Create subsets
+    train_dataset = torch.utils.data.Subset(dataset, train_idx)
+    val_dataset = torch.utils.data.Subset(dataset, val_idx)
+    test_dataset = torch.utils.data.Subset(dataset, test_idx)
+
+    return train_dataset, val_dataset, test_dataset
 
 def main():
+    torch.backends.cudnn.benchmark = True  # Enables CuDNN auto-tuner for faster runtime if input sizes are uniform
+
     # Set default data path
     default_data_path = 'data/processed/training_data.pt'
     
@@ -186,45 +181,59 @@ def main():
     # Print data path being used
     print(f"Using data from: {args.data_path}")
     
-    # Prepare data
-    dataset, train_mask, val_mask, test_mask = prepare_data(args)
+    # Load the processed data and extract metadata
+    data = torch.load(args.data_path, weights_only=False)
+    metadata = data['metadata']
     
-    # Create data loaders
+    # Prepare data and split subsets
+    train_dataset, val_dataset, test_dataset = prepare_data(args)
+    
+    # Create data loaders from the subsets
     train_loader = torch.utils.data.DataLoader(
-        dataset,
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=8,                 # Increase based on your CPU cores
+        pin_memory=True,               # Only effective for GPU training
+        persistent_workers=True,
         collate_fn=custom_collate
     )
-    
+
     val_loader = torch.utils.data.DataLoader(
-        dataset,
+        val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True,
         collate_fn=custom_collate
     )
-    
+
     test_loader = torch.utils.data.DataLoader(
-        dataset,
+        test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True,
         collate_fn=custom_collate
     )
-    
+        
     # Create model
     model = get_temporal_model(args)
     
-    # Create Lightning module
+    # Create the Lightning module.
+    target_tickers = None  
+    # To restrict predictions, uncomment:
+    # target_tickers = ['TSLA', 'AAPL']
+
     lightning_model = TemporalGNNLightning(
         model=model,
         lr=args.lr,
         weight_decay=args.weight_decay,
-        train_mask=train_mask,
-        val_mask=val_mask,
-        test_mask=test_mask
+        target_tickers=target_tickers,  # if used
+        # target_features=["returns", "volatility"]  # override if needed; default is "returns"
+        metadata=metadata
     )
     
     # Set up callbacks
@@ -245,24 +254,30 @@ def main():
     # Set up logger
     logger = TensorBoardLogger('logs/', name='temporal_gnn')
     
-    # Create trainer
+    # Determine accelerator and devices based on availability of CUDA.
+    if torch.cuda.is_available():
+        accelerator = 'gpu'
+        devices = [args.gpu] if args.gpu >= 0 else None
+    else:
+        accelerator = 'cpu'
+        devices = 1  # Use 1 CPU core
+
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
-        accelerator='gpu' if args.gpu >= 0 else 'cpu',
-        devices=[args.gpu] if args.gpu >= 0 else None,
+        accelerator=accelerator,
+        devices=devices,
         callbacks=[checkpoint_callback, early_stopping],
         logger=logger,
-        deterministic=True
+        deterministic=True,
+        log_every_n_steps=20   # Optional: Lower logging frequency to reduce overhead if needed
     )
     
-    # Train model
     trainer.fit(
         lightning_model,
         train_dataloaders=train_loader,
         val_dataloaders=val_loader
     )
     
-    # Test model
     trainer.test(
         lightning_model,
         dataloaders=test_loader
