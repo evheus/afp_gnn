@@ -266,6 +266,16 @@ def construct_lead_lag_matrix(df, method, max_lag=5, weights=None, alpha=0.01):
     """
     Construct a skew-symmetric lead-lag matrix for stock returns based on the method.
     """
+
+    window_size = df.index.nunique()  # Gets number of unique timestamps
+    
+    # Add validation for max_lag
+    max_possible_lag = (window_size // 2) - 1  # Ensure at least 2 points for correlation
+    max_lag = min(max_lag, max_possible_lag)
+    
+    if max_lag < 1:
+        raise ValueError(f"Window size {window_size} too small for lead-lag calculation. Need at least 4 points.")
+
     stocks = df.columns.get_level_values(0).unique()
     n_stocks = len(stocks)
     lead_lag_matrix = np.zeros((n_stocks, n_stocks))
@@ -290,9 +300,9 @@ def construct_lead_lag_matrix(df, method, max_lag=5, weights=None, alpha=0.01):
         for j, stock2 in enumerate(stocks):
             if i != j:
                 stock2_returns = df[stock2]['normalized_return']
-                #if method == 'C1':
+                # if method == 'C1':
                 #    score = compute_score(stock1, stock2, stock1_returns, stock2_returns)
-                #else:
+                # else:
                 score = compute_score(stock1_returns, stock2_returns)
 
                 lead_lag_matrix[i, j] = score

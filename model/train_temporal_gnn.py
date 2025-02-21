@@ -163,6 +163,31 @@ def prepare_data(args):
 
     return train_dataset, val_dataset, test_dataset
 
+def compute_hit_rate(model, dataloader):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for batch in dataloader:
+            # Ensure batch is transferred properly
+            batch = model.on_before_batch_transfer(batch, model.device) if hasattr(model, 'device') else batch
+            x_seq = batch['x_seq']
+            edge_index_seq = batch['edge_index_seq']
+            y = batch['y']
+            
+            pred = model(x_seq, edge_index_seq)
+            # Adjust predictions and labels using the same helper as during training.
+            pred, y = model._adjust_predictions_and_labels(pred, y)
+            all_preds.append(pred)
+            all_labels.append(y)
+        
+    all_preds = torch.cat(all_preds, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+    
+    # Compute hit rate: proportion where sign(pred) equals sign(true)
+    hit_rate = (torch.sign(all_preds) == torch.sign(all_labels)).float().mean().item()
+    return hit_rate
+
 def main():
     torch.backends.cudnn.benchmark = True  # Enables CuDNN auto-tuner for faster runtime if input sizes are uniform
 
@@ -193,7 +218,7 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=8,                 # Increase based on your CPU cores
+        num_workers=12,                 # Increase based on your CPU cores
         pin_memory=True,               # Only effective for GPU training
         persistent_workers=True,
         collate_fn=custom_collate
@@ -203,7 +228,7 @@ def main():
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=8,
+        num_workers=12,
         pin_memory=True,
         persistent_workers=True,
         collate_fn=custom_collate
@@ -213,7 +238,7 @@ def main():
         test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=8,
+        num_workers=12,
         pin_memory=True,
         persistent_workers=True,
         collate_fn=custom_collate
@@ -269,19 +294,24 @@ def main():
         callbacks=[checkpoint_callback, early_stopping],
         logger=logger,
         deterministic=True,
-        log_every_n_steps=20   # Optional: Lower logging frequency to reduce overhead if needed
+        log_every_n_steps=30,  # Lower logging frequency to reduce overhead
+        precision=16           # Enable mixed precision training (for CUDA only)
     )
-    
+
     trainer.fit(
         lightning_model,
         train_dataloaders=train_loader,
         val_dataloaders=val_loader
     )
-    
+
     trainer.test(
         lightning_model,
         dataloaders=test_loader
     )
+
+    # After training and testing, evaluate hit rate.
+    hit_rate = compute_hit_rate(lightning_model, test_loader)
+    print(f"Out-of-sample hit rate: {hit_rate:.4f}")
 
 if __name__ == "__main__":
     main()

@@ -3,7 +3,7 @@ import numpy as np
 import os
 import sys
 from typing import Dict, List, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 
 project_root = os.getcwd()
 sys.path.append(project_root)
@@ -67,34 +67,37 @@ def create_rolling_windows(
     sequence_length: int,
     frequency: str = '1min'
 ) -> Tuple[np.ndarray, List[pd.Timestamp]]:
-    """
-    Create rolling windows tensor from lead-lag matrices.
-    """
     timestamps = sorted(matrices.keys())
     num_nodes = matrices[timestamps[0]].shape[0]
     
     # Create frequency-based sampling points
-    start_time = timestamps[sequence_length - 1]
-    end_time = timestamps[-2] # so num_samples can match the feature/label generation.
-    sampling_points = pd.date_range(start=start_time, end=end_time, freq=frequency)
+    start_time_point = timestamps[sequence_length - 1]
+    end_time_point = timestamps[-2]  # ensure next label exists
+    sampling_points = pd.date_range(start=start_time_point, end=end_time_point, freq=frequency)
     
-    # Filter sampling points
-    valid_sampling_points = [t for t in sampling_points if t in timestamps]
+    # Define market hours
+    market_open = time(9, 30)
+    market_close = time(16, 0)
     
-    # Initialize tensor
+    # Filter sampling points to include only timestamps within trading hours and that exist in data.
+    valid_sampling_points = [
+        t for t in sampling_points
+        if market_open <= t.time() <= market_close and t in timestamps
+    ]
+    
+    # Debug: print valid sampling points for lead-lag tensor
+    print("Valid sampling points for lead-lag:", valid_sampling_points)
+    
     num_samples = len(valid_sampling_points)
     tensor = np.zeros((num_samples, sequence_length, num_nodes, num_nodes))
     window_timestamps = []
     
-    # Fill tensor with rolling windows
-    for i, end_time in enumerate(valid_sampling_points):
-        end_idx = timestamps.index(end_time)
-        
+    for i, cur_time in enumerate(valid_sampling_points):
+        current_idx = timestamps.index(cur_time)
         for j in range(sequence_length):
-            matrix_time = timestamps[end_idx - (sequence_length - 1) + j]
-            tensor[i, j] = matrices[matrix_time].values
-        
-        window_timestamps.append(end_time)
+            window_time = timestamps[current_idx - (sequence_length - 1) + j]
+            tensor[i, j] = matrices[window_time].values
+        window_timestamps.append(cur_time)
     
     return tensor, window_timestamps
 
@@ -186,13 +189,65 @@ def display_tensor_info(
         )
         print(df.round(4))
 
+def generate_leadlag_tensor_from_data(
+    processed_data: pd.DataFrame,
+    tickers: set,
+    matrix_lookback: str,
+    sequence_length: int,
+    freq: str
+) -> Tuple[np.ndarray, List[pd.Timestamp], List[str]]:
+    """
+    Generate lead-lag tensor from preprocessed data. Only windows with sufficient data
+    are used. In this implementation we filter out calc points before market open.
+    """
+    lead_lag_matrices = {}
+
+    # Define a market open time used as an additional filter.
+    market_open_time = time(9, 30)
+    
+    # Calculate start of calculation points. We ensure that the earliest calc point
+    # is at least matrix_lookback after data starts.
+    calc_start = processed_data.index.min() + pd.Timedelta(matrix_lookback)
+    # Generate calc points over the entire data range...
+    calc_points = pd.date_range(start=calc_start, end=processed_data.index.max(), freq=freq)
+    
+    # Filter calc points to only include those at or after market open.
+    calc_points = [t for t in calc_points if t.time() >= market_open_time]
+    
+    # Now compute matrices for each calc point. Skip if window has fewer than 2 data points.
+    for current_time in calc_points:
+        window_start = current_time - pd.Timedelta(matrix_lookback)
+        # Check if the window start is before our data starts; if so, skip.
+        if window_start < processed_data.index.min():
+            continue
+        
+        window_data = processed_data.loc[window_start:current_time]
+        
+        if len(window_data) < 2:
+            print(f"Skipping {current_time}: window size ({len(window_data)}) is too small to compute covariance.")
+            continue
+        
+        try:
+            lead_lag_matrix = construct_lead_lag_matrix(window_data, method='C1')
+            lead_lag_matrices[current_time] = lead_lag_matrix
+        except Exception as e:
+            print(f"Error calculating lead-lag for {current_time}: {e}")
+    
+    # Create rolling windows tensor
+    tensor, window_timestamps = create_rolling_windows(lead_lag_matrices, sequence_length, freq)
+    if not window_timestamps:
+        raise ValueError("No valid rolling windows were generated from lead-lag matrices.")
+    # Assume ordering of nodes is determined by the index of the first valid matrix.
+    node_list = list(lead_lag_matrices[window_timestamps[0]].index)
+    return tensor, window_timestamps, node_list
+
 if __name__ == "__main__":
-    # Set parameters
-    tickers = {'AAPL', 'AMZN', 'TSLA'}
+    # Use an ordered list instead of a set for consistent ordering
+    tickers = ['AAPL', 'AMZN', 'TSLA']  # or sorted(['AAPL', 'AMZN', 'TSLA'])
     start_date = '2024-11-28'
     end_date = '2024-11-29'
     matrix_lookback = '5min'
-    sequence_length = 5  # Changed from tensor_lookback
+    sequence_length = 5
     freq = '1min'
     data_folder = os.path.join(project_root, 'data', 'ohlcv')
     

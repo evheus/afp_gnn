@@ -190,6 +190,10 @@ class TemporalGNNLightning(pl.LightningModule):
             # Default to predicting all features (should not happen with our new default)
             self.target_feature_indices = None
 
+    def forward(self, x_seq, edge_index_seq):
+        # Simply pass through to your underlying model
+        return self.model(x_seq, edge_index_seq)
+
     def on_before_batch_transfer(self, batch, device):
         # Ensure x_seq and y are moved to the training device,
         # but leave edge_index_seq on CPU (for sparse operations).
@@ -244,7 +248,7 @@ class TemporalGNNLightning(pl.LightningModule):
             pred = pred.index_select(1, target_nodes)
             y = y.index_select(1, target_nodes)
         elif pred.size(1) != y.size(1):
-            self.print(f"Adjusting prediction tensor from shape {pred.shape} to match labels shape {y.shape}")
+            # self.print(f"Adjusting prediction tensor from shape {pred.shape} to match labels shape {y.shape}")
             pred = pred[:, :y.size(1), :]
 
         # Now, restrict to target feature(s) if specified.

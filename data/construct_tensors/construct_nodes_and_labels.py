@@ -3,7 +3,7 @@ import numpy as np
 import os
 import sys
 from typing import Dict, List, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 
 project_root = os.getcwd()
 sys.path.append(project_root)
@@ -29,8 +29,11 @@ def create_feature_matrices(
     """
     Create feature matrices for each timestamp and return the column names.
     """
+    # Use tickers as is - don't add SPY here since it's already in the input set
+    ordered_tickers = sorted(list(tickers))
+    
     # Load data
-    dfs = load_data_for_tickers(tickers, [start_date, end_date], data_folder)
+    dfs = load_data_for_tickers(ordered_tickers, [start_date, end_date], data_folder)
     
     # Create multi-index DataFrame
     processed_data = pd.concat(dfs, axis=1)
@@ -54,27 +57,49 @@ def create_feature_matrices(
         processed_data[(ticker, 'returns')] = price_data.pct_change()
         processed_data[(ticker, 'volatility')] = calculate_volatility(price_data, matrix_lookback)
     
-    # Select features for each timestamp
-    # We define feature_names here explicitly (or you can derive them if they change dynamically)
-    feature_names = ['returns', 'volume', 'volatility']
-    for current_time in calc_points:
+    # # Add this in create_feature_matrices after volatility calculation
+    # for ticker in all_tickers:
+    #     vol = processed_data[(ticker, 'volatility')].mean()
+    #     print(f"Average volatility for {ticker}: {vol:.4f}")
+    
+    # Calculate sampling points
+    calc_start = processed_data.index.min() + pd.Timedelta(matrix_lookback)
+    calc_points = pd.date_range(start=calc_start,
+                                end=processed_data.index.max(),
+                                freq=freq)
+
+    # Define market open and close times.
+    market_open = time(9, 30)
+    market_close = time(16, 0)
+
+    # Filter calc_points to only include times within trading hours and that exist in processed_data.index
+    valid_calc_points = [
+        t for t in calc_points 
+        if market_open <= t.time() <= market_close and t in processed_data.index
+    ]
+
+    # Debug: print valid calculation points for features
+    print("Valid calc points for features:", valid_calc_points)
+
+    feature_matrices = {}
+    feature_names = ['returns', 'log_volume', 'volatility']
+
+    for current_time in valid_calc_points:
         features = []
-        
-        for ticker in all_tickers:  # Changed from tickers to all_tickers
-            # Get returns, volume, and volatility
+        # Change this line to use ordered_tickers instead of tickers
+        for ticker in ordered_tickers:  # <- This is the key change
             returns = processed_data.loc[current_time, (ticker, 'returns')]
             volume = processed_data.loc[current_time, (ticker, 'volume')]
+            log_volume = np.log(volume + 1e-8)
             volatility = processed_data.loc[current_time, (ticker, 'volatility')]
-            
-            features.append([returns, volume, volatility])
+            features.append([returns, log_volume, volatility])
         
-        # Create feature matrix for current timestamp
         feature_matrices[current_time] = pd.DataFrame(
             features,
-            index=all_tickers,  # Changed from list(tickers) to all_tickers
+            index=ordered_tickers,  # <- Also change this
             columns=feature_names
         )
-    
+
     return feature_matrices, feature_names
 
 def create_feature_and_label_tensors(
@@ -84,17 +109,6 @@ def create_feature_and_label_tensors(
 ) -> Tuple[np.ndarray, np.ndarray, List[pd.Timestamp]]:
     """
     Create rolling windows tensor and corresponding label tensor.
-    
-    Args:
-        matrices: Dictionary mapping timestamps to feature matrices
-        sequence_length: Number of sequential matrices to include in each sample
-        frequency: Sampling frequency for the windows
-        
-    Returns:
-        Tuple containing:
-        - node_features: Shape (num_samples, sequence_length, num_nodes, num_features)
-        - label_tensor: Shape (num_samples, num_nodes, num_features)
-        - window_timestamps: List of timestamps for each window
     """
     timestamps = sorted(matrices.keys())
     num_nodes = matrices[timestamps[0]].shape[0]
@@ -102,11 +116,19 @@ def create_feature_and_label_tensors(
     
     # Create frequency-based sampling points
     start_time = timestamps[sequence_length - 1]
-    end_time = timestamps[-2]  # Use second-to-last timestamp to ensure labels exist
+    end_time = timestamps[-2]  # Ensure labels exist
+    
     sampling_points = pd.date_range(start=start_time, end=end_time, freq=frequency)
     
-    # Filter sampling points
-    valid_sampling_points = [t for t in sampling_points if t in timestamps]
+    # Define market open and close times.
+    market_open = time(9, 30)
+    market_close = time(16, 0)
+    
+    # Filter sampling points to only include times within trading hours
+    valid_sampling_points = [
+        t for t in sampling_points
+        if market_open <= t.time() <= market_close and t in timestamps
+    ]
     
     # Initialize tensors
     num_samples = len(valid_sampling_points)
@@ -118,12 +140,12 @@ def create_feature_and_label_tensors(
     for i, current_time in enumerate(valid_sampling_points):
         current_idx = timestamps.index(current_time)
         
-        # Fill feature tensor
+        # Fill feature tensor for each window
         for j in range(sequence_length):
-            matrix_time = timestamps[current_idx - (sequence_length - 1) + j]
-            node_features[i, j] = matrices[matrix_time].values
+            window_time = timestamps[current_idx - (sequence_length - 1) + j]
+            node_features[i, j] = matrices[window_time].values
         
-        # Fill label tensor with next timestep's features
+        # Fill label tensor with the next timestep's features
         next_time = timestamps[current_idx + 1]
         label_tensor[i] = matrices[next_time].values
         
@@ -210,6 +232,66 @@ def generate_node_features_with_features(
     
     return node_features, label_tensor, window_timestamps, node_list, feature_names
 
+def generate_node_features_with_features_from_data(
+    processed_data: pd.DataFrame,
+    tickers: set,
+    matrix_lookback: str,
+    sequence_length: int,
+    freq: str
+) -> Tuple[np.ndarray, np.ndarray, List[pd.Timestamp], List[str], List[str]]:
+    """
+    Generate node features and labels using the given processed_data.
+    """
+    # First build the feature matrices.
+    feature_matrices, feature_names = create_feature_matrices_from_data(
+        processed_data, tickers, matrix_lookback, freq
+    )
+    # Then create tensors with rolling windows.
+    node_features, label_tensor, feat_timestamps = create_feature_and_label_tensors(
+        feature_matrices, sequence_length, freq
+    )
+    # Suppose the ordered node list is the DataFrame index of one feature matrix.
+    feat_nodes = list(feature_matrices[next(iter(feature_matrices))].index)
+    return node_features, label_tensor, feat_timestamps, feat_nodes, feature_names
+
+def create_feature_matrices_from_data(
+    processed_data: pd.DataFrame,
+    tickers: set,
+    matrix_lookback: str,
+    freq: str
+) -> Tuple[Dict[pd.Timestamp, pd.DataFrame], List[str]]:
+    from datetime import time as dt_time
+    calc_start = processed_data.index.min() + pd.Timedelta(matrix_lookback)
+    calc_points = pd.date_range(start=calc_start, end=processed_data.index.max(), freq=freq)
+    
+    market_open = dt_time(9, 30)
+    market_close = dt_time(16, 0)
+    
+    valid_calc_points = [
+        t for t in calc_points
+        if market_open <= t.time() <= market_close and t in processed_data.index
+    ]
+    print("DEBUG: Valid calc points for features:", valid_calc_points)
+    
+    feature_matrices = {}
+    feature_names = ['returns', 'log_volume', 'volatility']
+    for current_time in valid_calc_points:
+        features = []
+        for ticker in tickers:
+            returns = processed_data.loc[current_time, (ticker, 'returns')]
+            volume = processed_data.loc[current_time, (ticker, 'volume')]
+            log_volume = np.log(volume + 1e-8)
+            volatility = processed_data.loc[current_time, (ticker, 'volatility')]
+            features.append([returns, log_volume, volatility])
+        
+        feature_matrices[current_time] = pd.DataFrame(
+            features,
+            index=list(tickers),
+            columns=feature_names
+        )
+    
+    return feature_matrices, feature_names
+
 def display_tensor_info(
     node_features: np.ndarray,
     label_tensor: np.ndarray,
@@ -255,18 +337,19 @@ def display_tensor_info(
         print(df.round(4))
 
 if __name__ == "__main__":
-    # Set parameters
-    tickers = {'AAPL', 'AMZN', 'TSLA'}
-    start_date = '2024-11-28'
-    end_date = '2024-11-29'
+    # Use an ordered list instead of a set for consistent ordering
+    tickers = ['AAPL', 'AMZN', 'TSLA']  # Ensure consistent order
+    all_tickers = sorted(tickers + ['SPY'])  # Add SPY to the list, and sort once
+    start_date = '2024-11-21'
+    end_date = '2024-11-22'
     matrix_lookback = '5min'
     sequence_length = 5
     freq = '1min'
     data_folder = os.path.join(project_root, 'data', 'ohlcv')
     
-    # Generate tensors
+    # Generate tensors with SPY included in processing
     node_features, label_tensor, window_timestamps, node_list = generate_node_features(
-        tickers,
+        set(all_tickers),  # Pass all_tickers including SPY
         start_date,
         end_date,
         matrix_lookback,

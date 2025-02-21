@@ -82,11 +82,10 @@ def preprocess_data(df):
     # remove multi index introduced in groupby
     df.index = df.index.get_level_values(-1)
 
-    # df['log_return'] = np.log(df['close'] / df['close'].shift(1))   # return over the previous minute
-    df['log_return'] = np.log(df['close'].shift(-1) / df['close'])    # return over the next minute
+    df['log_return'] = np.log(df['close'] / df['close'].shift(1))   # return over the previous minute
 
     # removing open and close (15 min buffer)
-    df = df.between_time('09:00', '16:00')
+    df = df.between_time('09:0', '16:00')
 
     # removing half day
     #df = df[~((df.index.month == 11) & (df.index.day == 29))]
@@ -103,16 +102,21 @@ def preprocess_data(df):
 
 
 def load_data_for_tickers(tickers, date_range, data_folder="ohlcv"):
-    """
-    Load and preprocess data for given tickers within a specific date range.
-    """
-    start_date, end_date = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
+    # Assume date_range items are naive and represent UTC times,
+    # then convert them to US Eastern.
+    start_date = pd.Timestamp(date_range[0], tz='UTC').tz_convert('US/Eastern')
+    end_date = pd.Timestamp(date_range[1], tz='UTC').tz_convert('US/Eastern')
+    
     dfs = {}
-
     for ticker in tickers:
         print(f"Loading data for {ticker}...")
         df = load_data(ticker, folder=data_folder)
         df = preprocess_data(df)
+        # Ensure that the DataFrame index is in US Eastern time.
+        if df.index.tz is None:
+            df.index = pd.to_datetime(df.index).tz_localize('UTC').tz_convert('US/Eastern')
+        else:
+            df.index = df.index.tz_convert('US/Eastern')
         df = df[(df.index.date >= start_date.date()) & (df.index.date <= end_date.date())]
         dfs[ticker] = df
 
@@ -268,3 +272,29 @@ def perform_eda(df, ticker=None, show_plots=False):
 
     df.drop(columns=[f'{col}_ma5' for col in ['open', 'high', 'low', 'close']] + 
                     [f'{col}_diff' for col in ['open', 'high', 'low', 'close']] + ['minute'], inplace=True)
+
+def load_and_preprocess_all_data(tickers: list, date_range: list, data_folder="ohlcv") -> pd.DataFrame:
+    """
+    Load and preprocess data for all tickers once and return a concatenated
+    multi-index DataFrame within the specified date range.
+    """
+    dfs = {}
+    for ticker in tickers:
+        print(f"Loading data for {ticker}...")
+        df = load_data(ticker, folder=data_folder)
+        df = preprocess_data(df)
+        if df.index.tz is None:
+            df.index = pd.to_datetime(df.index).tz_localize('UTC').tz_convert('US/Eastern')
+        else:
+            df.index = df.index.tz_convert('US/Eastern')
+        dfs[ticker] = df
+    
+    processed_data = pd.concat(dfs, axis=1)
+    processed_data.columns = pd.MultiIndex.from_product([list(dfs.keys()), dfs[list(dfs.keys())[0]].columns])
+    
+    # Filter data within date range (inclusive) assuming date_range is in Eastern time
+    start_date = pd.Timestamp(date_range[0], tz='US/Eastern')
+    end_date = pd.Timestamp(date_range[1], tz='US/Eastern')
+    processed_data = processed_data.loc[start_date:end_date + pd.Timedelta(days=1)]
+    
+    return processed_data
