@@ -3,6 +3,8 @@ from torch import nn, optim
 import torch.nn.functional as F
 from torch.nn import LSTM, Linear, ModuleList
 import pytorch_lightning as pl
+import traceback
+
 
 from directed_gnn_layers import DirGCNConv, DirSAGEConv, DirGATConv
 
@@ -20,6 +22,9 @@ class TemporalGNN(nn.Module):
         bidirectional=False
     ):
         super(TemporalGNN, self).__init__()
+        
+        # Initialize device
+        self.device = 'cpu'  # Default to CPU, will be updated during forward pass
         
         self.num_gnn_layers = num_gnn_layers
         self.hidden_dim = hidden_dim
@@ -61,71 +66,117 @@ class TemporalGNN(nn.Module):
         else:
             raise ValueError(f"Unsupported convolution type: {conv_type}")
             
-    def _apply_gnn(self, x, edge_index):
-        # Save the original device (e.g., mps)
-        orig_device = x.device
+    def _apply_gnn(self, x, edge_index, edge_weight):
+        """Apply GNN layer while ensuring proper device management."""
+        device = x.device
+        # print(f"Input to GNN shape: {x.shape}")  # Add this debug print
+        # halt = input("Press Enter to continue...")
 
-        # Move x to CPU for the sparse operations.
-        x_cpu = x.cpu()
-        # Temporarily move all GNN layers to CPU.
-        self.gnn_layers.to("cpu")
+        # Keep sparse tensors on CPU
+        edge_index = edge_index.cpu()
+        if edge_weight is not None:
+            edge_weight = edge_weight.cpu()
+        
+        for layer in self.gnn_layers:
+            # Dropout on current device
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            
+            # Apply GNN layer (which internally handles device placement)
+            x = layer(x, edge_index, edge_weight)
 
-        for conv in self.gnn_layers:
-            x_cpu = conv(x_cpu, edge_index)
-            x_cpu = F.relu(x_cpu)
-            x_cpu = F.dropout(x_cpu, p=self.dropout, training=self.training)
+            # print(f"After GNN layer shape: {x.shape}")
+            # halt = input("Enter to continue...")
+            
+            # Ensure output is on correct device
+            x = x.to(device)
+        
+        return x  
 
-        # Move the output back to the original device.
-        out = x_cpu.to(orig_device)
-
-        # (Optional) Move the GNN layers back to orig_device for subsequent operations.
-        self.gnn_layers.to(orig_device)
-
-        return out
-    
-    def forward(self, x_sequence, edge_index_sequence):
-        """
-        Forward pass through the temporal GNN.
+    def forward(self, x_seq, edge_index_seq, edge_weight_seq):
+        """Process a batch of temporal graph sequences through GNN and LSTM layers.
         
         Args:
-            x_sequence: Tensor of shape (batch, sequence_length, num_nodes, num_features)
-            edge_index_sequence: List of edge_index tensors for each time step,
-                                 where each tensor is of shape (2, num_edges)
-        Returns:
-            predictions: Tensor of shape (batch, num_nodes, output_dim)
-                         with per-node predictions (e.g. future prices).
+            x_seq: Node features [batch_size, seq_len, num_nodes, feat_dim]
+            edge_index_seq: List[batch_size][seq_len] of edge indices [2, num_edges]
+            edge_weight_seq: List[batch_size][seq_len] of edge weights [num_edges]
         """
-        batch_size, sequence_length, num_nodes, _ = x_sequence.size()
-        gnn_outputs = []
+        # Extract dimensions
+        batch_size, seq_len, num_nodes, feat_dim = x_seq.shape
+        device = x_seq.device
         
-        # Process each time step individually.
-        for t in range(sequence_length):
-            x_t = x_sequence[:, t]  # Shape: (batch, num_nodes, num_features)
-            edge_index_t = edge_index_sequence[t]
-            # Apply the GNN layers on the snapshot for time step t.
-            # _apply_gnn should output a tensor of shape (batch, num_nodes, hidden_dim)
-            x_t = self._apply_gnn(x_t, edge_index_t)
-            gnn_outputs.append(x_t)
+        has_issues = False
+        debug_info = []
         
-        # Stack over time to build the temporal dimension.
-        # gnn_outputs now has shape: (batch, sequence_length, num_nodes, hidden_dim)
-        gnn_outputs = torch.stack(gnn_outputs, dim=1)
+        # Process each batch and timestep through GNN
+        batch_outputs = []
+        for b in range(batch_size):
+            timestep_outputs = []
+            for t in range(seq_len):
+                # Get current timestep data
+                x_t = x_seq[b, t]  # [num_nodes, feat_dim]
+                edge_index_t = edge_index_seq[b][t]  # [2, num_edges]
+                edge_weight_t = edge_weight_seq[b][t]  # [num_edges]
+                
+                # Check for numerical issues
+                if torch.isnan(x_t).any() or torch.isnan(edge_weight_t).any():
+                    has_issues = True
+                    debug_info.append(f"NaN detected at batch {b}, timestep {t}")
+                    debug_info.append(f"x_t NaNs: {torch.isnan(x_t).sum().item()}")
+                    debug_info.append(f"edge_weights NaNs: {torch.isnan(edge_weight_t).sum().item()}")
+                
+                # Apply GNN (sparse ops on CPU)
+                x_t = self._apply_gnn(x_t.unsqueeze(0), edge_index_t, edge_weight_t)
+                # Check for NaNs after GNN
+                if torch.isnan(x_t).any():
+                    has_issues = True
+                    debug_info.append(f"NaN detected after GNN at batch {b}, timestep {t}")
+
+                timestep_outputs.append(x_t)
+            
+            # Stack timesteps for this batch [seq_len, num_nodes, hidden_dim]
+            batch_out = torch.cat(timestep_outputs, dim=1)
+            batch_outputs.append(batch_out)
         
-        # Reshape the tensor so that each node's sequence is processed individually by the LSTM.
-        B, T, N, H = gnn_outputs.size()
-        node_sequences = gnn_outputs.view(B * N, T, H)
+        # Stack all batches [batch_size, seq_len, num_nodes, hidden_dim]
+        x = torch.cat(batch_outputs, dim=0)
         
-        # Process each node's temporal sequence using the LSTM.
-        lstm_out, _ = self.lstm(node_sequences)
-        # For prediction, we use the final hidden state from the LSTM for each node.
-        final_hidden = lstm_out[:, -1, :]  # Shape: (B * N, H')
+        # self._debug_print("After GNN Processing", {
+        #     "Combined output": x.shape
+        # })
         
-        # Pass through a predictor layer (e.g., a Linear layer) to output the predicted price.
-        predictions = self.predictor(final_hidden)  # Expected shape: (B * N, output_dim)
+        # Reshape for LSTM [batch_size * num_nodes, seq_len, hidden_dim]
+        try:
+            x = x.reshape(batch_size * num_nodes, seq_len, self.hidden_dim)
+            # self._debug_print("LSTM Input", {"Reshaped": x.shape})
+        except RuntimeError as e:
+            self._debug_print("Reshape Error", {
+                "Current shape": x.shape,
+                "Current elements": x.numel(),
+                "Target elements": batch_size * num_nodes * seq_len * self.hidden_dim
+            })
+            raise e
         
-        # Reshape predictions back to (batch, num_nodes, output_dim)
-        predictions = predictions.view(B, N, -1)
-        return predictions
+        # Process through LSTM
+        x, _ = self.lstm(x)
+        # self._debug_print("LSTM Output", {"Shape": x.shape})
+        
+        # Take final timestep and reshape [batch_size, num_nodes, hidden_dim]
+        x = x[:, -1].reshape(batch_size, num_nodes, -1)
+        # self._debug_print("Final LSTM", {"Shape": x.shape})
+        
+        # Final prediction
+        x = self.predictor(x)
+        # self._debug_print("Prediction", {"Shape": x.shape})
+        # halt=input("Press Enter to continue...")
+        return x.to(device)
+
+    def _debug_print(self, title, shapes):
+        """Helper method for consistent debug output formatting."""
+        print(f"\n=== {title} ===")
+        for name, shape in shapes.items():
+            print(f"{name}: {shape}")
+        # if self.training:  # Only pause for input during training
+        #     input("Press Enter to continue...")
 
 def get_temporal_model(args):
     return TemporalGNN(
@@ -141,124 +192,243 @@ def get_temporal_model(args):
     )
 
 class TemporalGNNLightning(pl.LightningModule):
-    def __init__(
-        self,
-        model,
-        lr,
-        weight_decay,
-        target_tickers=None,
-        target_features="returns",   # Default now predicts only 'returns'
-        metadata=None,
-    ):
-        """
-        Args:
-            model: An instance of TemporalGNN.
-            lr: Learning rate.
-            weight_decay: Weight decay.
-            target_tickers: Optional list of tickers to restrict predictions.
-            target_features: Feature name or list of feature names to select for prediction.
-                            Default is "returns".
-            metadata: Dictionary that includes ticker_to_index and feature_to_index.
-        """
+    def __init__(self, model, lr, weight_decay, target_tickers=None, target_features=None, metadata=None):
         super().__init__()
+        self.save_hyperparameters(ignore=['model'])
         self.model = model
         self.lr = lr
         self.weight_decay = weight_decay
-        self.metadata = metadata or {}
+        self.target_tickers = target_tickers
+        self.target_features = target_features or ["returns"]
+        self.metadata = metadata
         
-        # Set up ticker restriction if provided.
-        if target_tickers is not None:
-            if 'ticker_to_index' not in self.metadata:
-                raise ValueError("metadata must include ticker_to_index if using target_tickers.")
-            ticker_to_index = self.metadata['ticker_to_index']
-            self.target_nodes = [ticker_to_index[ticker] for ticker in target_tickers if ticker in ticker_to_index]
-            if len(self.target_nodes) == 0:
-                raise ValueError("None of the provided target tickers were found.")
-        else:
-            self.target_nodes = None
+        # Initialize test storage as empty lists
+        self.test_predictions = []
+        self.test_labels = []
+        
+        # Pre-compute feature indices if possible
+        if self.target_features and self.metadata:
+            feature_to_index = self.metadata.get('feature_to_index', {})
+            self.target_feature_indices = [
+                idx for feat, idx in feature_to_index.items()
+                if feat in self.target_features
+            ]
+            if not self.target_feature_indices:
+                print(f"Warning: No valid features found. Available: {list(feature_to_index.keys())}")
+    
+    def on_test_start(self):
+        """Reset test storage at start of testing"""
+        self.test_predictions = []
+        self.test_labels = []
+    
+    def test_step(self, batch, batch_idx):
+        """Process one test batch and store results"""
+        x_seq = batch['x_seq'].to(self.device)
+        y = batch['y'].to(self.device)
+        
+        # Check input for issues
+        if torch.isnan(x_seq).any() or torch.isnan(y).any():
+            print(f"\n=== Warning: NaN detected in input (Batch {batch_idx}) ===")
+            print(f"x_seq NaNs: {torch.isnan(x_seq).sum().item()}")
+            print(f"y NaNs: {torch.isnan(y).sum().item()}")
+        
+        # Process edges
+        edge_index_seq = [
+            [edge_tensor.cpu() for edge_tensor in sample_seq] 
+            for sample_seq in batch['edge_index_seq']
+        ]
+        edge_weight_seq = [
+            [weight_tensor.cpu() for weight_tensor in sample_seq]
+            for sample_seq in batch['edge_weight_seq']
+        ]
 
-        # Set up feature selection.
-        if target_features is not None:
-            if 'feature_to_index' not in self.metadata:
-                raise ValueError("metadata must include feature_to_index if using target_features.")
-            # Allow target_features as string or list.
-            if isinstance(target_features, str):
-                self.target_feature_indices = [self.metadata['feature_to_index'][target_features]]
-            else:
-                self.target_feature_indices = [self.metadata['feature_to_index'][feat] for feat in target_features]
-        else:
-            # Default to predicting all features (should not happen with our new default)
-            self.target_feature_indices = None
+        # Forward pass
+        pred = self.model(x_seq, edge_index_seq, edge_weight_seq)
+        
+        # Check predictions for issues
+        if torch.isnan(pred).any():
+            print(f"\n=== Warning: NaN detected in predictions (Batch {batch_idx}) ===")
+            print(f"Raw predictions NaNs: {torch.isnan(pred).sum().item()}")
+            print(f"Value range: [{pred.min().item():.4f}, {pred.max().item():.4f}]")
+        
+        # Adjust predictions
+        pred, y = self._adjust_predictions_and_labels(pred, y)
+        
+        # Check for post-adjustment issues
+        if torch.isnan(pred).any():
+            print(f"\n=== Warning: NaN detected after adjustment (Batch {batch_idx}) ===")
+            print(f"Adjusted predictions NaNs: {torch.isnan(pred).sum().item()}")
+        
+        # Calculate metrics
+        test_loss = F.mse_loss(pred, y)
+        test_mae = F.l1_loss(pred, y)
+        
+        if torch.isnan(test_loss) or torch.isnan(test_mae):
+            print(f"\n=== Warning: NaN detected in metrics (Batch {batch_idx}) ===")
+            print(f"MSE: {test_loss.item()}")
+            print(f"MAE: {test_mae.item()}")
+        
+        self.test_predictions.append(pred.detach().cpu())
+        self.test_labels.append(y.detach().cpu())
+        
+        return test_loss
 
-    def forward(self, x_seq, edge_index_seq):
-        # Simply pass through to your underlying model
-        return self.model(x_seq, edge_index_seq)
+    def on_test_end(self):
+        """Combine all test predictions"""
+        if isinstance(self.test_predictions, list) and len(self.test_predictions) > 0:
+            self.test_predictions = torch.cat(self.test_predictions)
+            self.test_labels = torch.cat(self.test_labels)
 
-    def on_before_batch_transfer(self, batch, device):
-        # Ensure x_seq and y are moved to the training device,
-        # but leave edge_index_seq on CPU (for sparse operations).
-        batch["x_seq"] = batch["x_seq"].to(device)
-        batch["y"] = batch["y"].to(device)
-        return batch
+    def forward(self, x_seq, edge_index_seq, edge_weight_seq):
+        return self.model(x_seq, edge_index_seq, edge_weight_seq)
 
     def training_step(self, batch, batch_idx):
-        x_seq = batch['x_seq']                    # (batch, sequence_length, num_nodes, num_features)
-        edge_index_seq = batch['edge_index_seq']    # remains on CPU (or as originally collated)
-        y = batch['y']                            # (batch, label_node_count, output_dim)
+        # Batch supposed to contain:
+        # - x_seq: [32, 5, 10, 3]         (batch, seq_len, nodes, features)
+        # - edge_index_seq: list of 5 tensors, each [2, 1280]
+        # - edge_weight_seq: list of 5 tensors, each [1280]
+        # - y: [32, 10, 3]                (batch, nodes, features)
 
-        pred = self.model(x_seq, edge_index_seq)    # (batch, full_num_nodes, output_dim)
-        pred, y = self._adjust_predictions_and_labels(pred, y)
+        # print(f"\n=== Training Step {batch_idx} ===")
+        # for i in batch.keys() : print(f"{i} shape: {batch[i].shape}")
+        # halt = input("Press Enter to continue...")  
+
+        # Move dense tensors to GPU, keep sparse on CPU
+        x_seq = batch['x_seq'].to(self.device)
+        y = batch['y'].to(self.device)
+        
+        # Monitor input NaNs
+        if torch.isnan(x_seq).any() or torch.isnan(y).any():
+            print(f"\n=== Warning: NaN detected in training input (Batch {batch_idx}) ===")
+            print(f"x_seq NaNs: {torch.isnan(x_seq).sum().item()}")
+            print(f"y NaNs: {torch.isnan(y).sum().item()}")
+
+        edge_index_seq = [
+            [edge_tensor.cpu() for edge_tensor in sample_seq] 
+            for sample_seq in batch['edge_index_seq']
+        ]
+        edge_weight_seq = [
+            [weight_tensor.cpu() for weight_tensor in sample_seq]
+            for sample_seq in batch['edge_weight_seq']
+        ]
+        
+        pred = self(x_seq, edge_index_seq, edge_weight_seq)
+
+        # Monitor prediction NaNs
+        if torch.isnan(pred).any():
+            print(f"\n=== Warning: NaN detected in training predictions (Batch {batch_idx}) ===")
+            print(f"Predictions NaNs: {torch.isnan(pred).sum().item()}")
+
         loss = F.mse_loss(pred, y)
-        self.log('train_loss', loss, batch_size=x_seq.size(0))
+
+        # Monitor loss NaNs
+        if torch.isnan(loss):
+            print(f"\n=== Warning: NaN detected in training loss (Batch {batch_idx}) ===")
+        
+        self.log('train_loss', loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x_seq = batch['x_seq']
-        edge_index_seq = batch['edge_index_seq']
-        y = batch['y']
+        # print(f"\n=== Validation Step {batch_idx} ===")
+        # for key in batch.keys():
+        #     if isinstance(batch[key], (list, tuple)):
+        #         print(f"{key}: [List of {len(batch[key])} elements]")
+        #         if isinstance(batch[key][0], (list, tuple)):
+        #             # Handle nested lists
+        #             print(f"First element: List of {len(batch[key][0])} elements")
+        #             print(f"First inner element shape: {batch[key][0][0].shape}")
+        #         else:
+        #             # Handle list of tensors
+        #             print(f"First element shape: {batch[key][0].shape}")
+        #     else:
+        #         print(f"{key} shape: {batch[key].shape}")
+        # halt = input("Press Enter to continue...")
 
-        pred = self.model(x_seq, edge_index_seq)
-        pred, y = self._adjust_predictions_and_labels(pred, y)
-        val_loss = F.mse_loss(pred, y)
-        self.log('val_loss', val_loss, batch_size=x_seq.size(0))
-        return val_loss
+        x_seq = batch['x_seq'].to(self.device)
 
-    def test_step(self, batch, batch_idx):
-        x_seq = batch['x_seq']
-        edge_index_seq = batch['edge_index_seq']
-        y = batch['y']
+        # Handle nested lists for edge data
+        # batch['edge_index_seq'] is [batch_size][seq_length][2, num_edges]
+        edge_index_seq = [
+            [edge_tensor.cpu() for edge_tensor in sample_seq] 
+            for sample_seq in batch['edge_index_seq']
+        ]
+        edge_weight_seq = [
+            [weight_tensor.cpu() for weight_tensor in sample_seq]
+            for sample_seq in batch['edge_weight_seq']
+        ]
 
-        pred = self.model(x_seq, edge_index_seq)
-        pred, y = self._adjust_predictions_and_labels(pred, y)
-        test_loss = F.mse_loss(pred, y)
-        test_mae = F.l1_loss(pred, y)
-        self.log("test_loss", test_loss, batch_size=x_seq.size(0))
-        self.log("test_mae", test_mae, batch_size=x_seq.size(0))
+        y = batch['y'].to(self.device)
+
+        # # Debug shapes
+        # print("\n=== Data Device Allocation ===")
+        # print(f"x_seq device: {x_seq.device}")
+        # print(f"First edge index device: {edge_index_seq[0][0].device}")
+        # print(f"First edge weight device: {edge_weight_seq[0][0].device}")
+        
+        pred = self(x_seq, edge_index_seq, edge_weight_seq)
+        loss = F.mse_loss(pred, y)
+
+        self.log('val_loss', loss)
+        return loss
+
+
+    def on_test_epoch_end(self):
+        # Concatenate all predictions and labels
+        self.test_predictions = torch.cat(self.test_predictions, dim=0)
+        self.test_labels = torch.cat(self.test_labels, dim=0)
 
     def _adjust_predictions_and_labels(self, pred, y):
-        """
-        Adjust predictions and labels by optionally selecting a subset of nodes and features.
-        """
-        # First, ensure y is on the same device as pred.
-        y = y.to(pred.device)
-
-        # Restrict to target nodes if specified.
-        if self.target_nodes is not None:
-            target_nodes = torch.tensor(self.target_nodes, device=pred.device)
-            pred = pred.index_select(1, target_nodes)
-            y = y.index_select(1, target_nodes)
-        elif pred.size(1) != y.size(1):
-            # self.print(f"Adjusting prediction tensor from shape {pred.shape} to match labels shape {y.shape}")
-            pred = pred[:, :y.size(1), :]
-
-        # Now, restrict to target feature(s) if specified.
-        if self.target_feature_indices is not None:
-            feature_idx_tensor = torch.tensor(self.target_feature_indices, device=pred.device)
-            # Assume the feature dimension is the last one.
-            pred = pred.index_select(2, feature_idx_tensor)
-            y = y.index_select(2, feature_idx_tensor)
+        """Adjust predictions and labels by selecting subset of nodes and features."""
+        import traceback
+        
+        try:
+            # Check for NaNs in input
+            has_nans = torch.isnan(pred).any() or torch.isnan(y).any()
+            if has_nans:
+                print("\n=== Input Validation ===")
+                print(f"NaNs detected:")
+                print(f"- pred NaNs: {torch.isnan(pred).sum().item()}")
+                print(f"- y NaNs: {torch.isnan(y).sum().item()}")
+                print(f"Shapes: pred {pred.shape}, y {y.shape}")
             
-        return pred, y
+            # Ensure consistent device placement
+            y = y.to(pred.device)
+            
+            # Handle target nodes and feature selection
+            if hasattr(self, 'target_nodes') and self.target_nodes is not None:
+                feature_to_index = self.metadata.get('feature_to_index', {})
+                feature_indices = [
+                    idx for feat, idx in feature_to_index.items()
+                    if feat in self.target_features
+                ]
+                
+                if not feature_indices:
+                    print(f"\n=== Feature Selection Warning ===")
+                    print(f"No valid features found.")
+                    print(f"Target features: {self.target_features}")
+                    print(f"Available features: {list(feature_to_index.keys())}")
+                    return pred, y
+                    
+                feature_idx_tensor = torch.tensor(feature_indices, device=pred.device)
+                pred = pred.index_select(2, feature_idx_tensor)
+                y = y.index_select(2, feature_idx_tensor)
+                
+                # Check for NaNs after selection
+                if torch.isnan(pred).any() or torch.isnan(y).any():
+                    print("\n=== Post-Selection Warning ===")
+                    print(f"NaNs after feature selection:")
+                    print(f"- pred NaNs: {torch.isnan(pred).sum().item()}")
+                    print(f"- y NaNs: {torch.isnan(y).sum().item()}")
+            
+            return pred, y
+            
+        except Exception as e:
+            print("\n=== Error Traceback ===")
+            print(traceback.format_exc())
+            print("State at error:")
+            print(f"- pred: shape {pred.shape}, device {pred.device}, NaNs {torch.isnan(pred).sum().item()}")
+            print(f"- y: shape {y.shape}, device {y.device}, NaNs {torch.isnan(y).sum().item()}")
+            raise
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)

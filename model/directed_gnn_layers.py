@@ -33,29 +33,52 @@ def get_conv(conv_type, input_dim, output_dim, alpha):
 class DirGCNConv(torch.nn.Module):
     def __init__(self, input_dim, output_dim, alpha):
         super(DirGCNConv, self).__init__()
-
         self.input_dim = input_dim
         self.output_dim = output_dim
-
         self.lin_src_to_dst = Linear(input_dim, output_dim)
         self.lin_dst_to_src = Linear(input_dim, output_dim)
         self.alpha = alpha
-        self.adj_norm, self.adj_t_norm = None, None
+        self.forward_count = 0  # Add counter for debugging
 
-    def forward(self, x, edge_index):
-        if self.adj_norm is None:
-            row, col = edge_index
-            num_nodes = x.shape[0]
-
-            adj = SparseTensor(row=row, col=col, sparse_sizes=(num_nodes, num_nodes))
-            self.adj_norm = get_norm_adj(adj, norm="dir")
-
-            adj_t = SparseTensor(row=col, col=row, sparse_sizes=(num_nodes, num_nodes))
-            self.adj_t_norm = get_norm_adj(adj_t, norm="dir")
-
-        return self.alpha * self.lin_src_to_dst(self.adj_norm @ x) + (1 - self.alpha) * self.lin_dst_to_src(
-            self.adj_t_norm @ x
-        )
+    def forward(self, x, edge_index, edge_weight=None):
+        device = x.device
+        self.forward_count += 1
+        
+        # Always compute adjacency matrices for current sample
+        row, col = edge_index
+        num_nodes = x.shape[1]
+        
+        # Debug prints (every N passes to avoid spam)
+        # if self.forward_count % 100 == 0:
+        #     print(f"\n=== DirGCNConv Pass {self.forward_count} ===")
+        #     print(f"Number of nodes: {num_nodes}")
+        #     print(f"Number of edges: {edge_index.shape[1]}")
+        #     print(f"Edge weight shape: {edge_weight.shape if edge_weight is not None else None}")
+        
+        # Create adjacency matrices for current sample
+        adj = SparseTensor(row=row, col=col, value=edge_weight, 
+                          sparse_sizes=(num_nodes, num_nodes))
+        abs_adj = SparseTensor(row=row, col=col, value=torch.abs(edge_weight), 
+                              sparse_sizes=(num_nodes, num_nodes))
+        
+        # Compute normalized adjacencies
+        adj_norm = get_norm_adj(adj, abs_adj, norm="dir")
+        
+        # Same for transposed adjacency
+        adj_t = SparseTensor(row=col, col=row, value=edge_weight, 
+                            sparse_sizes=(num_nodes, num_nodes))
+        abs_adj_t = SparseTensor(row=col, col=row, value=torch.abs(edge_weight), 
+                                sparse_sizes=(num_nodes, num_nodes))
+        adj_t_norm = get_norm_adj(adj_t, abs_adj_t, norm="dir")
+        
+        # Move data to CPU for sparse operations
+        x_cpu = x.cpu()
+        
+        # Compute convolution and move back to original device
+        out = (self.alpha * self.lin_src_to_dst((adj_norm @ x_cpu).to(device)) + 
+               (1 - self.alpha) * self.lin_dst_to_src((adj_t_norm @ x_cpu).to(device)))
+        
+        return out
 
 
 class DirSAGEConv(torch.nn.Module):

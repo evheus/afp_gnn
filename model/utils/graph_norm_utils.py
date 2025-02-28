@@ -17,37 +17,62 @@ def row_norm(adj):
     return mul(adj, 1 / row_sum.view(-1, 1))
 
 
-def directed_norm(adj):
-    """
-    Applies the normalization for directed graphs:
-    D_out^(-1/2) A D_in^(-1/2)
-    where D_out and D_in are the out-degree and in-degree diagonal matrices.
-    """
-    # Assuming `adj` is a SparseTensor from torch_sparse
-    # Ensure that the storage's row indices are on CPU.
+# def directed_norm(adj):
+#     """
+#     Applies the normalization for directed graphs:
+#     D_out^(-1/2) A D_in^(-1/2)
+#     where D_out and D_in are the out-degree and in-degree diagonal matrices.
+#     """
+#     # Assuming `adj` is a SparseTensor from torch_sparse
+#     # Ensure that the storage's row indices are on CPU.
+#     row, _, _ = adj.coo()  # unpack row, col, and value
+#     row = row.cpu()
+#     # Proceed with your normalization (e.g., summation)
+#     out_deg = sparsesum(adj, dim=1)
+#     in_deg = sparsesum(adj, dim=0)
+#     in_deg_inv_sqrt = in_deg.pow_(-0.5)
+#     in_deg_inv_sqrt.masked_fill_(in_deg_inv_sqrt == float("inf"), 0.0)
+
+#     out_deg_inv_sqrt = out_deg.pow_(-0.5)
+#     out_deg_inv_sqrt.masked_fill_(out_deg_inv_sqrt == float("inf"), 0.0)
+
+#     adj = mul(adj, out_deg_inv_sqrt.view(-1, 1))
+#     adj = mul(adj, in_deg_inv_sqrt.view(1, -1))
+#     return adj
+
+def directed_norm(adj, abs_adj):
+    # Ensure that the storage's row indices are on CPU
     row, _, _ = adj.coo()  # unpack row, col, and value
     row = row.cpu()
-    # Proceed with your normalization (e.g., summation)
-    out_deg = sparsesum(adj, dim=1)
-    in_deg = sparsesum(adj, dim=0)
+    
+    # Use abs_adj for degree calculations
+    out_deg = sparsesum(abs_adj, dim=1)
+    in_deg = sparsesum(abs_adj, dim=0)
+    
+    # Compute normalization factors using the absolute values
     in_deg_inv_sqrt = in_deg.pow_(-0.5)
     in_deg_inv_sqrt.masked_fill_(in_deg_inv_sqrt == float("inf"), 0.0)
-
+    
     out_deg_inv_sqrt = out_deg.pow_(-0.5)
     out_deg_inv_sqrt.masked_fill_(out_deg_inv_sqrt == float("inf"), 0.0)
-
+    
+    # Apply normalization to the original adj (with signs)
     adj = mul(adj, out_deg_inv_sqrt.view(-1, 1))
     adj = mul(adj, in_deg_inv_sqrt.view(1, -1))
     return adj
 
 
-def get_norm_adj(adj, norm):
+def get_norm_adj(adj, abs_adj=None, norm="dir"):
     if norm == "sym":
-        return gcn_norm(adj, add_self_loops=False)
+        # For symmetric normalization, you'd need to adapt gcn_norm to use abs_adj
+        # or implement a custom version
+        return gcn_norm(adj, abs_adj, add_self_loops=False)
     elif norm == "row":
+        # Adapt row_norm to use abs_adj for normalization
         return row_norm(adj)
     elif norm == "dir":
-        return directed_norm(adj)
+        # Use our modified directed_norm
+        return directed_norm(adj, abs_adj)
     else:
         raise ValueError(f"{norm} normalization is not supported")
 

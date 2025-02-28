@@ -182,7 +182,85 @@ def compute_c1(stock1_returns, stock2_returns, max_lag):
         if shifted_corr > max_corr:
             max_corr = shifted_corr
 
-    return max_corr
+    return max(max_corr, 0)
+
+def compute_direction_score(stock1_returns, stock2_returns, max_lag, weighted=True, handle_negative="discard"):
+    """
+    Compute the Direction Score metric for two stocks.
+    
+    Parameters:
+    -----------
+    stock1_returns : pandas.Series
+        Returns for the first stock
+    stock2_returns : pandas.Series
+        Returns for the second stock
+    max_lag : int
+        Maximum lag to consider in both directions
+    weighted : bool, default=False
+        Whether to apply time weights (1/(|l|+1)) to the correlations
+    handle_negative : str, default="discard"
+        How to handle negative correlations:
+        - "discard": Treat negative correlations as zero
+        - "penalize": Include negative correlations but ensure sums remain nonnegative
+    
+    Returns:
+    --------
+    float
+        The Direction Score indicating the lead-lag relationship
+    """
+    if len(stock1_returns) != len(stock2_returns):
+        raise ValueError("Both return series must have the same length.")
+    
+    # Calculate correlations for all lags
+    correlations = {}
+    for lag in range(-max_lag, max_lag + 1):
+        if lag == 0:
+            continue  # Skip lag 0 as it's not used in the formula
+        
+        if lag < 0:
+            # Y leads X
+            shifted_corr = stock1_returns[:lag].corr(stock2_returns[-lag:])
+        else:  # lag > 0
+            # X leads Y
+            shifted_corr = stock1_returns[lag:].corr(stock2_returns[:-lag])
+            
+        correlations[lag] = shifted_corr
+    
+    # Process positive lags (X leads Y)
+    positive_sum = 0
+    for lag in range(1, max_lag + 1):
+        corr = correlations[lag]
+        
+        if handle_negative == "discard":
+            corr = max(corr, 0)
+        
+        if weighted:
+            corr *= 1 / (lag + 1)
+            
+        positive_sum += corr
+    
+    # Process negative lags (Y leads X)
+    negative_sum = 0
+    for lag in range(-max_lag, 0):
+        corr = correlations[lag]
+        
+        if handle_negative == "discard":
+            corr = max(corr, 0)
+            
+        if weighted:
+            corr *= 1 / (abs(lag) + 1)
+            
+        negative_sum += corr
+    
+    # Apply different handling for negative correlations
+    if handle_negative == "penalize":
+        positive_sum = max(positive_sum, 0)
+        negative_sum = max(negative_sum, 0)
+    
+    # Calculate the direction score
+    direction_score = positive_sum - negative_sum
+    
+    return direction_score
 
 
 def compute_levy_area(stock1_returns, stock2_returns):
@@ -291,8 +369,10 @@ def construct_lead_lag_matrix(df, method, max_lag=5, weights=None, alpha=0.01):
         compute_score = lambda stock1, stock2: compute_levy_area(stock1, stock2)
     elif method == 'Linear':
         return construct_ols_lead_lag_matrix(df, max_lag, alpha)
+    elif method == 'Direction':
+        compute_score = lambda stock1, stock2: compute_direction_score(stock1, stock2, max_lag)
     else:
-        raise ValueError("Invalid method. Choose from 'C1', 'C2', 'Levy', or 'Linear'.")
+        raise ValueError("Invalid method. Choose from 'C1', 'C2', 'Levy', 'Direction' or 'Linear'.")
 
     # Iterate over stock pairs
     for i, stock1 in enumerate(stocks):
@@ -318,7 +398,7 @@ def rank_stocks(window_data, method, max_lag):
     Rank stocks based on the average of their column values in the lead-lag matrix.
     If the method requires a lead-lag matrix, it computes it first.
     """
-    if method in ['C1', 'C2', 'Levy', 'Linear']:
+    if method in ['C1', 'C2', 'Levy', 'Direction' 'Linear']:
         # Compute lead-lag matrix 
         lead_lag_matrix = construct_lead_lag_matrix(window_data, method, max_lag)
         scores = lead_lag_matrix.mean(axis=0)
